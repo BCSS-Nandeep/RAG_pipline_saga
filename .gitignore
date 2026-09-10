@@ -1,0 +1,14 @@
+# Secrets — never commit; see .env.example for the required variables
+.env
+.env.*
+!.env.example
+
+# Logs & runtime output
+*.log
+reports/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
