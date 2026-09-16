@@ -302,6 +302,122 @@ _COUNT_TIME_PATTERNS = [
 ]
 
 
+# Qualifiers a count question can carry ("how many HIGH alerts", "how many
+# ESCALATED grievances"). Without these the count ignored every adjective in
+# the question and reported the collection total instead, so "how many high
+# alerts" answered 130,356 when the real figure was 17,857.
+#
+# Each entry is (pattern, mongo clause, label shown to the user). Order
+# matters: the most specific phrasing has to be tried first, which is why
+# "high priority" precedes the bare "high".
+#
+# `priority` and `risk_level` are DIFFERENT fields here and they disagree:
+# 13,039 docs are priority=LOW but risk_level=high, and no document with a
+# "HIGH Risk" title has priority=HIGH. Alert titles are generated from
+# risk_level, so that is what an officer reading the portal means by "high
+# alert". "High priority" is matched separately and the two are never merged.
+_COUNT_FILTERS: dict = {
+    "alerts": [
+        (r"\bhigh\s+priorit(y|ies)\b|\bpriority\s*[:=]?\s*high\b",
+         {"priority": "HIGH"}, "priority=HIGH"),
+        (r"\bmedium\s+priorit(y|ies)\b|\bpriority\s*[:=]?\s*medium\b",
+         {"priority": "MEDIUM"}, "priority=MEDIUM"),
+        (r"\blow\s+priorit(y|ies)\b|\bpriority\s*[:=]?\s*low\b",
+         {"priority": "LOW"}, "priority=LOW"),
+        (r"\b(high|critical|severe)(\s+(risk|severity|level))?\b",
+         {"risk_level": "high"}, "risk_level=high"),
+        (r"\bmedium(\s+(risk|severity|level))?\b|\bmoderate\b",
+         {"risk_level": "medium"}, "risk_level=medium"),
+        (r"\blow(\s+(risk|severity|level))?\b",
+         {"risk_level": "low"}, "risk_level=low"),
+        (r"\bunread\b", {"is_read": False}, "is_read=false"),
+        (r"\backnowledged\b", {"status": "acknowledged"}, "status=acknowledged"),
+        (r"\bescalated\b", {"status": "escalated"}, "status=escalated"),
+        (r"\bfalse\s+positives?\b", {"status": "false_positive"},
+         "status=false_positive"),
+        (r"\bactive\b|\bopen\b|\bunresolved\b", {"status": "active"},
+         "status=active"),
+        (r"\bunder\s+investigation\b|\binvestigations?\b",
+         {"is_investigation": True}, "is_investigation=true"),
+        (r"\b(twitter|x\.com)\b", {"platform": "x"}, "platform=x"),
+        (r"\binstagram\b|\binsta\b", {"platform": "instagram"},
+         "platform=instagram"),
+        (r"\byoutube\b", {"platform": "youtube"}, "platform=youtube"),
+        (r"\bfacebook\b|\bfb\b", {"platform": "facebook"}, "platform=facebook"),
+        (r"\bai\s*[-_]?\s*risk\b", {"alert_type": "ai_risk"},
+         "alert_type=ai_risk"),
+        (r"\bvelocity\b", {"alert_type": "velocity"}, "alert_type=velocity"),
+        (r"\bkeyword\s*[-_]?\s*risk\b", {"alert_type": "keyword_risk"},
+         "alert_type=keyword_risk"),
+    ],
+}
+
+# Words that carry no filtering meaning, so their presence must not trigger
+# the "could not interpret" caveat below.
+_COUNT_FILLER = frozenset("""
+a an the how many much count number total there is are was were do does did
+of in on at for from by with to and or not no me us i you we show tell give
+list please currently right now over during within between all any each
+some whats what which who whose why when where have has had been being
+post posts posting record records row rows entry entries item items
+doc docs document documents thing things data database db collection
+collections so far up till until as per about regarding across overall
+altogether alert alerts
+""".split())
+
+
+def _extract_count_filters(q: str, target_col: str, consumed: str) -> tuple:
+    """Turn the qualifiers in a count question into a Mongo filter.
+
+    Returns (clauses, labels, unknown_terms). *consumed* is the text already
+    accounted for -- the matched collection keyword and the time phrase -- and
+    is removed before scanning for leftovers, so only genuinely uninterpreted
+    words land in unknown_terms.
+    """
+    clauses: dict = {}
+    labels: list = []
+    remaining = " %s " % q
+    for token in consumed.lower().split():
+        remaining = remaining.replace(token, " ")
+    # Every way of naming this collection is part of the question's subject,
+    # not a qualifier: "how many dial 100 incidents" matched on "incidents",
+    # which would otherwise leave "dial" looking uninterpreted.
+    for kw in sorted(_COUNT_KEYWORDS.get(target_col, []), key=len, reverse=True):
+        remaining = re.sub(r"\b%s\b" % re.escape(kw), " ", remaining, flags=re.I)
+    for pattern, clause, label in _COUNT_FILTERS.get(target_col, []):
+        # A field already pinned by a more specific phrase wins: "high
+        # priority" must not then also be read as risk_level=high.
+        if any(k in clauses for k in clause):
+            continue
+        m = re.search(pattern, remaining, re.I)
+        if not m:
+            continue
+        clauses.update(clause)
+        labels.append(label)
+        remaining = remaining[:m.start()] + " " + remaining[m.end():]
+    # Removing whole phrases can still leave a fragment of the collection's
+    # own name ("dial 100 calls" matches "100 calls", leaving "dial"), so any
+    # word used in any of its keywords counts as subject, not qualifier.
+    subject = {t for kw in _COUNT_KEYWORDS.get(target_col, [])
+               for t in kw.lower().split()}
+    unknown = [w for w in re.findall(r"[a-z][a-z0-9_'-]{2,}", remaining.lower())
+               if w not in _COUNT_FILLER and w not in subject]
+    return clauses, labels, unknown
+
+
+def _count_noun(kw: str, n: int) -> str:
+    """Agree the matched keyword with the number in front of it.
+
+    The keyword is whatever the question happened to use, so "how many high
+    alert posts" matched the singular and read as "17,857 alert". Only simple
+    one-word keywords are touched; multi-word ones like "dial 100" are left
+    exactly as matched.
+    """
+    if n == 1 or " " in kw or kw.endswith("s"):
+        return kw
+    return kw + ("ies" if kw.endswith("y") and kw[-2:-1] not in "aeiou" else "s")
+
+
 def _count_fast_path(question: str, default_window_days: Optional[int]) -> Optional[dict]:
     """Detect 'how many <thing> in last N days/hours' and answer with a real Mongo count.
     Returns None if the question doesn't fit the count template."""
@@ -328,6 +444,17 @@ def _count_fast_path(question: str, default_window_days: Optional[int]) -> Optio
         delta = timedelta(days=default_window_days)
         matched_phrase = f"last {default_window_days} day(s)"
 
+    filters, labels, unknown = _extract_count_filters(
+        q, target_col, "%s %s" % (matched_kw, matched_phrase or ""))
+    # An exact count that silently drops a qualifier reads as an answer to a
+    # question it did not answer, so say plainly what was not applied.
+    caveat = ""
+    if unknown:
+        caveat = ("\n\n_Not applied to this count: %s — no matching field is "
+                  "known for it, so the figure above ignores that part of the "
+                  "question._" % ", ".join("`%s`" % w for w in unknown[:6]))
+    described = (" matching %s" % ", ".join("`%s`" % l for l in labels)) if labels else ""
+
     try:
         client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
         db = client[DB_NAME]
@@ -336,13 +463,18 @@ def _count_fast_path(question: str, default_window_days: Optional[int]) -> Optio
             return {"answer": f"The `{target_col}` collection isn't present in the database.",
                     "sources": [], "question": question, "scope": "count"}
         col = db[target_col]
-        total = col.estimated_document_count()
         if delta is None:
+            # estimated_document_count() ignores a filter, so it is only valid
+            # for the unfiltered total.
+            total = (col.count_documents(filters) if filters
+                     else col.estimated_document_count())
             client.close()
             return {
-                "answer": f"**{total:,}** {matched_kw} in total (all time) in `{target_col}`.",
+                "answer": (f"**{total:,}** {_count_noun(matched_kw, total)}{described} in total "
+                           f"(all time) in `{target_col}`.{caveat}"),
                 "sources": [], "question": question, "scope": "count",
                 "count": total, "collection": target_col,
+                "filters": filters or None,
             }
         cutoff = datetime.now(timezone.utc) - delta
         sample = col.find_one({}, sort=[("_id", DESCENDING)]) or {}
@@ -350,16 +482,21 @@ def _count_fast_path(question: str, default_window_days: Optional[int]) -> Optio
         if not ts_field:
             client.close()
             return None  # fall back to vector search
-        n = col.count_documents({ts_field: {"$gte": cutoff}})
+        query = dict(filters)
+        query[ts_field] = {"$gte": cutoff}
+        n = col.count_documents(query)
         client.close()
         nice_window = matched_phrase
         return {
             "answer": (
-                f"**Bottom line:** {n:,} {matched_kw} in `{target_col}` over the {nice_window}.\n\n"
+                f"**Bottom line:** {n:,} {_count_noun(matched_kw, n)}{described} in `{target_col}` "
+                f"over the {nice_window}.\n\n"
                 f"_(Counted via field `{ts_field}`, cutoff {cutoff.isoformat(timespec='minutes')} UTC.)_"
+                f"{caveat}"
             ),
             "sources": [], "question": question, "scope": "count",
             "count": n, "collection": target_col, "window": nice_window,
+            "filters": filters or None,
         }
     except Exception as e:
         logger.warning("count fast-path failed: %s", e)
