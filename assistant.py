@@ -1,6 +1,8 @@
 """
 assistant.py — STAGE 6
-  AI Assistant Query Engine powered by Ollama Qwen.
+  AI Assistant Query Engine. Chat generation runs on the OpenAI-compatible
+  LLM endpoint (see llm_client.py); embeddings via the OpenAI-compatible
+  /v1/embeddings route (see embedder.get_embedder).
   Embeds the user question, retrieves top-k context chunks via cosine search,
   builds a structured prompt, and generates an answer locally.
 """
@@ -13,7 +15,8 @@ from typing import Dict, Any, List, Optional
 
 import requests
 
-from embedder import OllamaEmbedder
+from embedder import get_embedder
+from llm_client import generate as llm_generate
 from vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
@@ -149,14 +152,15 @@ SYSTEM_PROMPT = textwrap.dedent("""\
 
     ═══ STRICT RULES ═══
       • NEVER fabricate handles, URLs, incidents, or statistics not in context.
-      • Answers MUST be at least 10 lines (≈200 words). Short answers are useless
-        to a Commissioner — go deeper, add evidence, add links, add context.
+      • Answer length must match the evidence. Be thorough when the context is
+        rich; be brief when it is thin. Padding a thin answer with filler or
+        general knowledge is a failure, not thoroughness.
       • Every post or alert you mention MUST end with `[View Post](URL)` if a URL
         exists in the context. Every handle/profile MUST end with `[Profile](URL)`
         when its profile URL is in the context.
-      • If the context has NO relevant data: state it plainly in one line, then
-        provide best general-knowledge labeled as _(General:…)_ — still aim for
-        10+ informative lines using domain expertise.
+      • If the context has NO relevant data: say so plainly in one or two lines
+        and stop. Do NOT substitute general knowledge, do NOT speculate about
+        what the data might contain, and do NOT pad the answer to look fuller.
       • Terse phrasing inside bullets, but expansive coverage. No apologies.
         No "based on the context provided" filler.
       • Bold **@handles**. Markdown links for all URLs. Code-format `BNS sections`.
@@ -175,9 +179,7 @@ class Assistant:
 
     def __init__(
         self,
-        ollama_base_url: str,
         llm_model: str,
-        embed_model: str,
         mongo_uri: str,
         db_name: str,
         vector_collection: str,
@@ -185,11 +187,11 @@ class Assistant:
         source_collection: Optional[str] = None,
     ):
         self.llm_model = llm_model
-        self.ollama_base_url = ollama_base_url.rstrip("/")
         self.top_k = top_k
         self.source_collection = source_collection
 
-        self.embedder = OllamaEmbedder(base_url=ollama_base_url, model=embed_model)
+        # Embedding backend comes from EMBED_* — self-hosted vLLM only.
+        self.embedder = get_embedder()
         self.store = VectorStore(uri=mongo_uri, db_name=db_name, collection_name=vector_collection)
 
     # -- public API ----------------------------------------------------------
@@ -220,7 +222,7 @@ class Assistant:
         q_vector = self.embedder.embed_text(question)
         if q_vector is None:
             return {
-                "answer": "Failed to generate embedding for the question. Is Ollama running?",
+                "answer": "Failed to generate the question embedding — is the vLLM embedding server reachable?",
                 "sources": [],
                 "question": question,
             }
@@ -259,7 +261,7 @@ class Assistant:
             len(results), len(seen_ids),
         )
 
-        # 4. Generate answer via Ollama Qwen
+        # 4. Generate answer via vLLM Qwen3
         answer = self._generate(prompt)
 
         # 5. Format sources
@@ -291,83 +293,22 @@ class Assistant:
         )
 
     def _generate(self, prompt: str) -> str:
-        """Call Ollama /api/generate with the assembled prompt.
+        """Generate the answer on the configured LLM endpoint.
 
-        Resilient to transient 500/502/503/504 errors. Retries with smaller
-        context windows; if the host is OOM, falls back to a smaller model
-        (env var OLLAMA_FALLBACK_MODEL, default ``qwen2.5:1.5b``).
+        Retries and context-fitting are handled inside llm_client; on terminal
+        failure it returns a marked "_(...)_" string so ``ask`` can still show
+        the retrieved evidence.
         """
-        import os
-        fallback_model = os.getenv("OLLAMA_FALLBACK_MODEL", "qwen2.5:1.5b")
-        url = f"{self.ollama_base_url}/api/generate"
-        # (model, num_ctx, num_predict)
-        attempts = [
-            (self.llm_model,  16384, 2048),
-            (self.llm_model,  12288, 1600),
-            (self.llm_model,   8192, 1200),
-            (fallback_model,   8192, 1200),
-            (fallback_model,   4096,  900),
-        ]
-        last_err: Optional[str] = None
-        oom_seen = False
-        for i, (model, ctx, predict) in enumerate(attempts):
-            if model == self.llm_model and i >= 3:
-                continue
-            payload = {
-                "model": model,
-                "prompt": prompt if i == 0 else self._shrink_prompt(prompt, ctx),
-                "stream": False,
-                "options": {
-                    "temperature": 0.2,
-                    "top_p": 0.9,
-                    "repeat_penalty": 1.1,
-                    "num_ctx": ctx,
-                    "num_predict": predict,
-                },
-                "keep_alive": "10m",
-            }
-            try:
-                resp = requests.post(url, json=payload, timeout=420)
-                if resp.status_code in (500, 502, 503, 504):
-                    body = ""
-                    try:
-                        body = resp.json().get("error", "") or ""
-                    except Exception:
-                        body = (resp.text or "")[:200]
-                    logger.warning("Ollama %s on attempt %d (model=%s): %s",
-                                   resp.status_code, i + 1, model, body)
-                    last_err = f"{resp.status_code} — {body or resp.reason}"
-                    if "memory" in body.lower() or "oom" in body.lower():
-                        oom_seen = True
-                    time.sleep(1.5 * (i + 1))
-                    continue
-                resp.raise_for_status()
-                text = (resp.json().get("response") or "").strip()
-                if text:
-                    return text
-                logger.warning("Ollama returned empty response on attempt %d", i + 1)
-            except requests.ConnectionError as exc:
-                logger.error("Cannot reach Ollama at %s: %s", self.ollama_base_url, exc)
-                return f"Error: Ollama is not reachable at {self.ollama_base_url}."
-            except requests.Timeout as exc:
-                logger.warning("Ollama timeout on attempt %d", i + 1)
-                last_err = f"timeout ({exc})"
-            except Exception as exc:
-                logger.warning("Ollama attempt %d failed: %s", i + 1, exc)
-                last_err = str(exc)
-                time.sleep(1.0 * (i + 1))
-
-        if oom_seen:
-            return (
-                "_(The Ollama host is out of memory — the model couldn't be loaded. "
-                f"Free RAM on `{self.ollama_base_url}` or pull a smaller model "
-                f"(`ollama pull {fallback_model}`). "
-                "Retrieved evidence is shown below.)_"
-            )
-        return (
-            f"_(LLM generation failed: {last_err}. "
-            "Retrieved evidence is shown below — please retry.)_"
+        return llm_generate(
+            prompt,
+            temperature=0.2,
+            top_p=0.9,
+            max_tokens=2048,
+            model=self.llm_model or None,
         )
+
+    # ``llm_model`` is whatever the caller passed; callers now pass LLM_MODEL
+    # from .env. Anything falsy falls through to llm_client's own default.
 
     @staticmethod
     def _shrink_prompt(prompt: str, target_ctx: int) -> str:

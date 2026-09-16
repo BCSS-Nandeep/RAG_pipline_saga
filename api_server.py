@@ -2,7 +2,7 @@
 api_server.py — FastAPI bridge for the RAG pipeline.
 
 Exposes REST endpoints so the Node.js backend (or any client) can:
-  - GET  /api/rag/health          → pipeline + Ollama health check
+  - GET  /api/rag/health          → MongoDB + vLLM embedding + vLLM LLM health
   - GET  /api/rag/collections     → list all MongoDB collections
   - POST /api/rag/query           → synchronous question (blocks until answer)
   - POST /api/rag/query/async     → enqueue question, returns {job_id} immediately
@@ -15,11 +15,13 @@ Run:
     uvicorn api_server:app --host 0.0.0.0 --port 8100 --reload
 """
 
+import hashlib
 import logging
 import os
 import re
 import textwrap
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -30,13 +32,21 @@ from typing import Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from pymongo import MongoClient, DESCENDING
 from starlette.middleware.wsgi import WSGIMiddleware
 
 from assistant import Assistant, SYSTEM_PROMPT, CONTEXT_SEPARATOR, _smalltalk_response
-from embedder import OllamaEmbedder
-from osint_portal.app import app as osint_portal_app
+from embedder import get_embedder
+from llm_client import generate as llm_generate, LLM_BASE_URL, LLM_MODEL
+import llm_client
+import intent as intent_router
+try:
+    from osint_portal.app import app as osint_portal_app
+except ModuleNotFoundError:          # sub-app not vendored in this repo
+    osint_portal_app = None
 from processor import MongoStreamProcessor, DocumentConverter
 from chunker import TokenAwareChunker
 from vector_store import VectorStore
@@ -48,13 +58,6 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
 DB_NAME = os.getenv("DB_NAME", "test")
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_LLM_MODEL = os.getenv("OLLAMA_LLM_MODEL", "qwen2.5:7b")
-OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
-# Smaller model used as a last-resort fallback when the primary model fails
-# with an out-of-memory 500 from Ollama. Pull it once on the Ollama host:
-#   ollama pull qwen2.5:1.5b
-OLLAMA_FALLBACK_MODEL = os.getenv("OLLAMA_FALLBACK_MODEL", "qwen2.5:1.5b")
 VECTOR_COLLECTION = os.getenv("VECTOR_COLLECTION", "vector_embeddings")
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "100"))
 CHUNK_MIN = int(os.getenv("CHUNK_MIN_TOKENS", "300"))
@@ -87,7 +90,20 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.mount("/osint", WSGIMiddleware(osint_portal_app))
+# Browser test console (static/index.html) — served from the API itself so it
+# shares an origin and needs no separate web server.
+_STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+if os.path.isdir(_STATIC_DIR):
+    app.mount("/ui", StaticFiles(directory=_STATIC_DIR, html=True), name="ui")
+
+    @app.get("/", include_in_schema=False)
+    def _root_redirect():
+        return RedirectResponse(url="/ui/")
+
+if osint_portal_app is not None:
+    app.mount("/osint", WSGIMiddleware(osint_portal_app))
+else:
+    logger.warning("osint_portal not installed — /osint not mounted.")
 
 # ---------------------------------------------------------------------------
 # Request / Response models
@@ -151,8 +167,8 @@ def _allow_ids_within_window(collection: str, days: int) -> Optional[set]:
 
 @app.get("/api/rag/health")
 def health():
-    """Check MongoDB and Ollama connectivity."""
-    status = {"mongodb": False, "ollama_embed": False, "ollama_llm": False}
+    """Check MongoDB, the embedding host and the LLM endpoint."""
+    status = {"mongodb": False, "embedding": False, "llm": False}
     try:
         client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
         client.admin.command("ping")
@@ -161,19 +177,36 @@ def health():
     except Exception as e:
         logger.error("MongoDB health check failed: %s", e)
 
-    embedder = OllamaEmbedder(OLLAMA_BASE_URL, OLLAMA_EMBED_MODEL)
-    status["ollama_embed"] = embedder.check_health()
+    embedding = get_embedder().probe()
+    status["embedding"] = embedding["healthy"]
 
-    import requests as req
-    try:
-        resp = req.get(f"{OLLAMA_BASE_URL.rstrip('/')}/api/tags", timeout=10)
-        models = [m["name"] for m in resp.json().get("models", [])]
-        status["ollama_llm"] = any(OLLAMA_LLM_MODEL in m for m in models)
-    except Exception:
-        pass
+    import llm_client
+    status["llm"] = llm_client.check_health()
 
     overall = all(status.values())
-    return {"healthy": overall, "services": status}
+    return {
+        "healthy": overall,
+        "services": status,
+        # Explicit model + dimension so a mismatch is visible, not inferred.
+        "embedding": {
+            "status": "HEALTHY" if embedding["healthy"] else "UNHEALTHY",
+            "warmup": _EMBED_WARMUP.get("ok"),
+            "warmup_error": _EMBED_WARMUP.get("error"),
+            "downloaded_on_start": _EMBED_WARMUP.get("downloaded"),
+            "cache_path": _EMBED_WARMUP.get("cache_path"),
+            "device": embedding.get("device"),
+            "model": embedding["model"],
+            "dimension": embedding["dimension"],
+            "expected_dimension": embedding["expected_dimension"],
+            "endpoint": embedding["endpoint"],
+            "error": embedding["error"],
+        },
+        "llm": {
+            "status": "HEALTHY" if status["llm"] else "UNHEALTHY",
+            "model": llm_client.LLM_MODEL,
+            "endpoint": llm_client.LLM_BASE_URL,
+        },
+    }
 
 
 @app.get("/api/rag/collections")
@@ -191,6 +224,9 @@ def list_collections():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# Filled in by the startup warm-up thread; surfaced via /api/rag/health.
+_EMBED_WARMUP: dict = {"ok": None, "error": None}
 
 _GLOBAL_STORES: dict = {}
 _GLOBAL_STORES_LOCK = threading.Lock()
@@ -341,91 +377,13 @@ def _shrink_prompt(prompt: str, target_ctx: int) -> str:
 
 
 def _llm_answer(prompt: str) -> str:
-    """Call Ollama /api/generate with retry-on-5xx and prompt-shrink fallback.
+    """Generate an answer on the configured LLM endpoint (see llm_client.py).
 
-    Tries 3 times: (16k ctx / 2048 out), then (12k / 1600), then (8k / 1200).
-    Sleeps with exponential backoff between retries. Returns the model's text
-    on success, or a clearly-labelled error string on terminal failure (so the
-    caller can still surface the retrieved evidence to the user).
+    Retries, context fitting and error formatting live in llm_client; on
+    terminal failure this returns a marked "_(...)_" string so callers can
+    still surface the retrieved MongoDB evidence to the user.
     """
-    import time as _time
-
-    url = f"{OLLAMA_BASE_URL.rstrip('/')}/api/generate"
-    # Each attempt = (model, num_ctx, num_predict). Later attempts use smaller
-    # context AND, eventually, the small fallback model — to survive an OOM
-    # host where the primary 7B model can't be loaded.
-    attempts = [
-        (OLLAMA_LLM_MODEL,      16384, 900),
-        (OLLAMA_LLM_MODEL,      12288, 1600),
-        (OLLAMA_LLM_MODEL,       8192, 1200),
-        (OLLAMA_FALLBACK_MODEL,  8192, 1200),
-        (OLLAMA_FALLBACK_MODEL,  4096,  900),
-    ]
-    last_err: Optional[str] = None
-    oom_seen = False
-    for i, (model, ctx, predict) in enumerate(attempts):
-        # Skip the duplicate fallback if it's the same as the primary
-        if model == OLLAMA_LLM_MODEL and i >= 3:
-            continue
-        try:
-            resp = requests.post(
-                url,
-                json={
-                    "model": model,
-                    "prompt": prompt if i == 0 else _shrink_prompt(prompt, ctx),
-                    "stream": False,
-                    "options": {
-                        "temperature": 0.2,
-                        "top_p": 0.9,
-                        "repeat_penalty": 1.1,
-                        "num_ctx": ctx,
-                        "num_predict": predict,
-                    },
-                    "keep_alive": "10m",
-                },
-                timeout=420,
-            )
-            if resp.status_code in (500, 502, 503, 504):
-                body = ""
-                try:
-                    body = resp.json().get("error", "") or ""
-                except Exception:
-                    body = (resp.text or "")[:200]
-                logger.warning("Ollama %s on attempt %d (model=%s): %s",
-                               resp.status_code, i + 1, model, body)
-                last_err = f"{resp.status_code} — {body or resp.reason}"
-                if "memory" in body.lower() or "oom" in body.lower():
-                    oom_seen = True
-                _time.sleep(1.5 * (i + 1))
-                continue
-            resp.raise_for_status()
-            text = (resp.json().get("response") or "").strip()
-            if text:
-                return text
-            logger.warning("Ollama returned empty response on attempt %d", i + 1)
-            last_err = "empty response"
-        except requests.ConnectionError as e:
-            logger.error("Ollama connection error: %s", e)
-            return f"Error generating answer: Ollama unreachable at {OLLAMA_BASE_URL} ({e})."
-        except requests.Timeout as e:
-            logger.warning("Ollama timeout on attempt %d", i + 1)
-            last_err = f"timeout ({e})"
-        except Exception as e:
-            logger.warning("Ollama attempt %d failed: %s", i + 1, e)
-            last_err = str(e)
-            _time.sleep(1.0 * (i + 1))
-
-    if oom_seen:
-        return (
-            "_(The Ollama host is out of memory — the model couldn't be loaded. "
-            f"Free RAM on `{OLLAMA_BASE_URL}` or pull a smaller model "
-            f"(`ollama pull {OLLAMA_FALLBACK_MODEL}`). "
-            "Live evidence from MongoDB is shown below.)_"
-        )
-    return (
-        f"_(LLM generation failed after {len(attempts)} attempts: {last_err}. "
-        "Live evidence from MongoDB is shown below — please retry.)_"
-    )
+    return llm_generate(prompt, temperature=0.2, top_p=0.9, max_tokens=2048)
 
 
 _URL_RE = re.compile(r"https?://[^\s)\]]+")
@@ -456,10 +414,15 @@ CHAT_ONLY_SYSTEM_PROMPT = textwrap.dedent("""\
 
 def _chat_only_answer(question: str) -> dict:
     """Pure LLM call — no DB, no vector search. For casual / general questions."""
-    smalltalk = _smalltalk_response(question)
-    if smalltalk is not None:
-        return {"answer": smalltalk, "sources": [], "question": question,
-                "smalltalk": True, "scope": "chat_only"}
+    verdict = intent_router.classify(question)
+    if verdict.intent is intent_router.Intent.GREETING:
+        return {"answer": intent_router.greeting_answer(question), "sources": [],
+                "question": question, "smalltalk": True, "scope": "chat_only",
+                "intent": verdict.intent.value, "rag_used": False}
+    if verdict.intent is intent_router.Intent.CAPABILITY:
+        return {"answer": intent_router.CAPABILITY_ANSWER, "sources": [],
+                "question": question, "scope": "chat_only",
+                "intent": verdict.intent.value, "rag_used": False}
     prompt = (
         f"{CHAT_ONLY_SYSTEM_PROMPT}\n\n"
         f"User: {question}\n\n"
@@ -478,12 +441,13 @@ def _ensure_minimum_answer(answer: str, snippets: list, question: str) -> str:
     snippets so officers always have the URLs to act on.
     """
     answer = (answer or "").strip()
-    line_count = len([ln for ln in answer.splitlines() if ln.strip()])
-    has_link = bool(_URL_RE.search(answer)) or "](http" in answer
+    # Only rescue a genuinely failed generation. Padding short answers used to
+    # force a 10-line briefing even when the context did not support one, which
+    # is exactly the hallucination pressure the intent router removes.
     needs_evidence = (
-        line_count < 10
-        or not has_link
+        not answer
         or answer.startswith("_(LLM generation failed")
+        or answer.startswith("_(Error generating answer")
         or "Error generating answer" in answer
     )
     if not needs_evidence or not snippets:
@@ -1063,130 +1027,248 @@ def _build_db_context(question: str, window_days: Optional[int], limit_per: int 
         return [], 0
 
 
+def _vector_candidates(question: str) -> list:
+    """Semantic hits for *question*, or [] when no embedding host is reachable.
+
+    Unchanged retrieval mechanics — same embedder, same VectorStore, same
+    cosine search over the same collections.
+    """
+    try:
+        embedder = get_embedder()
+        q_vec = embedder.embed_text(question)
+        if q_vec is None:
+            return []
+        hits: list = []
+        for vc in _list_vector_collections():
+            try:
+                store = _get_store(vc)
+                hits.extend(store.cosine_search(
+                    query_vector=q_vec, top_k=4, query_text=question))
+            except Exception:
+                pass
+        hits.sort(key=lambda r: r.get("score", 0.0), reverse=True)
+        return hits
+    except Exception as exc:
+        logger.debug("vector enrichment skipped: %s", exc)
+        return []
+
+
+# Completion size for a grounded RAG answer. Smaller than the old 2048: the
+# answer should be as long as the evidence warrants, and a smaller completion
+# leaves more of the (currently tight) server context for actual evidence.
+_RAG_COMPLETION_TOKENS = 1600
+
+
 def _global_query(question: str, top_k: int, time_window_days: Optional[int]) -> dict:
-    """
-    Unified query engine — architecture:
+    """Route by intent, then retrieve only what that intent actually needs.
 
-    1. Smalltalk shortcut  → canned greeting, no DB call.
-    2. Count fast-path     → real Mongo count, no LLM.
-    3. Universal DB context → ALWAYS pulls live alerts + grievances from Mongo.
-    4. Vector enrichment   → if vector store has indexed chunks, append the
-                             top semantic matches to the context (bonus signal).
-    5. LLM                 → Ollama synthesises DB facts + general Telangana
-                             knowledge into a police-grade briefing.
-    """
-    smalltalk = _smalltalk_response(question)
-    if smalltalk is not None:
-        return {"answer": smalltalk, "sources": [], "question": question, "smalltalk": True}
+    Previously every question — "hi" included — pulled alerts + grievances from
+    Mongo, appended vector hits, and asked for a 10+ line briefing. Now:
 
+      greeting / capability / unsupported -> answered without touching Mongo
+      general knowledge                   -> LLM only, no SOC-EYE context
+      data query                          -> retrieve, rank, budget, ground
+
+    Retrieval itself is unchanged; what changed is whether it runs and how much
+    of its output reaches the prompt.
+    """
+    started = time.time()
+    verdict = intent_router.classify(question)
+
+    log = {"intent": verdict.intent.value, "rag_used": False, "candidates": 0,
+           "contexts": 0, "context_tokens": 0, "prompt_tokens": 0,
+           "model": llm_client.LLM_MODEL, "llm_status": None}
+
+    def _finish(payload: dict) -> dict:
+        payload.setdefault("intent", verdict.intent.value)
+        payload.setdefault("rag_used", log["rag_used"])
+        payload.setdefault("context_count", log["contexts"])
+        payload.setdefault("context_tokens", log["context_tokens"])
+        payload.setdefault("prompt_tokens", log["prompt_tokens"])
+        if verdict.unsupported:
+            payload.setdefault("unsupported", [k for k, _ in verdict.unsupported])
+        logger.info(
+            "RAG q=%r intent=%s rag=%s candidates=%d (db=%s vec=%s) contexts=%d "
+            "ctx_tok=%d prompt_tok=%s model=%s llm=%s %.1fs",
+            question[:80], log["intent"], log["rag_used"], log["candidates"],
+            log.get("db_candidates", 0), log.get("vector_candidates", 0),
+            log["contexts"], log["context_tokens"], log["prompt_tokens"],
+            log["model"], log["llm_status"], time.time() - started,
+        )
+        return payload
+
+    # ── routes that need no retrieval ────────────────────────────────────────
+    if verdict.intent is intent_router.Intent.GREETING:
+        return _finish({"answer": intent_router.greeting_answer(question),
+                        "sources": [], "question": question,
+                        "scope": "greeting", "smalltalk": True})
+
+    if verdict.intent is intent_router.Intent.CAPABILITY:
+        return _finish({"answer": intent_router.CAPABILITY_ANSWER, "sources": [],
+                        "question": question, "scope": "capability"})
+
+    if verdict.intent is intent_router.Intent.UNSUPPORTED:
+        return _finish({"answer": intent_router.limitation_notice(
+                            verdict.unsupported, data_follows=False),
+                        "sources": [], "question": question,
+                        "scope": "unsupported"})
+
+    if verdict.intent is intent_router.Intent.GENERAL:
+        meta: dict = {}
+        answer = llm_generate(
+            f"{CHAT_ONLY_SYSTEM_PROMPT}\n\nUser: {question}\n\nAssistant:",
+            temperature=0.3, max_tokens=800, meta=meta)
+        log["llm_status"] = meta.get("status")
+        log["prompt_tokens"] = meta.get("prompt_tokens") or 0
+        return _finish({"answer": answer, "sources": [], "question": question,
+                        "scope": "general"})
+
+    # ── counts answer exactly, without an LLM ────────────────────────────────
     fast = _count_fast_path(question, time_window_days)
     if fast is not None:
-        return fast
+        log["rag_used"] = True
+        return _finish(fast)
 
-    # ── Step 3: Universal DB context (ALWAYS runs) ───────────────────────────
+    # ── retrieve candidates ──────────────────────────────────────────────────
+    log["rag_used"] = True
     days = time_window_days if time_window_days else 7
-    db_snippets, db_doc_count = _build_db_context(question, window_days=days, limit_per=10)
+    db_snippets, db_doc_count = _build_db_context(question, window_days=days,
+                                                  limit_per=10)
 
-    # ── Step 4: Vector enrichment (bonus — only if embeddings exist) ─────────
-    vec_extra_parts = []
-    try:
-        embedder = OllamaEmbedder(OLLAMA_BASE_URL, OLLAMA_EMBED_MODEL)
-        q_vec = embedder.embed_text(question)
-        if q_vec is not None:
-            vec_cols = _list_vector_collections()
-            per_store_k = 4
-            vec_hits: list = []
-            for vc in vec_cols:
-                try:
-                    store = _get_store(vc)
-                    results = store.cosine_search(query_vector=q_vec, top_k=per_store_k, query_text=question)
-                    vec_hits.extend(results)
-                except Exception:
-                    pass
-            vec_hits.sort(key=lambda r: r.get("score", 0.0), reverse=True)
-            for r in vec_hits[:6]:
-                meta = r.get("metadata", {})
-                if r.get("score", 0) >= 0.50:  # only include if reasonably relevant
-                    vec_extra_parts.append(
-                        f"[VEC · id={meta.get('document_id','')} · src={meta.get('source_collection','')} "
-                        f"· score={r['score']:.2f}]\n{r['text'][:400]}"
-                    )
-    except Exception as e:
-        logger.debug("vector enrichment skipped: %s", e)
+    # ── rank fusion ──────────────────────────────────────────────────────────
+    # The two retrievers score on scales that cannot be compared: the database
+    # side is a recency ordering, the vector side is cosine similarity. Scoring
+    # them on one axis let high database scores crowd out every semantically
+    # relevant chunk. Reciprocal Rank Fusion uses each list's RANK instead, so
+    # neither scale can dominate and a strong vector hit always competes.
+    #
+    #     RRF(d) = sum over lists of  1 / (K + rank(d))
+    #
+    # K damps the advantage of the very top positions; 60 is the standard value
+    # from the original RRF paper.
+    RRF_K = int(os.getenv("RRF_K", "60"))
 
-    # ── Step 5: Build final prompt + call LLM ────────────────────────────────
-    context_block = "\n\n---\n\n".join(db_snippets)
-    if vec_extra_parts:
-        context_block += "\n\n=== ADDITIONAL SEMANTIC MATCHES ===\n\n" + "\n\n".join(vec_extra_parts)
+    db_list = [{"text": s, "origin": "db", "rank": i}
+               for i, s in enumerate(db_snippets)]
 
-    if not context_block.strip():
-        context_block = "(No records found across the queried modules for this time window.)"
-
-    # Tell the LLM exactly which modules are present in the context block
-    # so it doesn't ignore non-alert data (events, dial100, POIs, keywords, etc.).
-    extra_modules = _detect_extra_collections(question)
-    module_label = "alerts, grievances"
-    if extra_modules:
-        pretty = {
-            "contents": "contents", "dial100incidents": "Dial 100 calls",
-            "events": "events", "pois": "persons of interest",
-            "keywords": "keywords", "sources": "monitored profiles",
-            "dailyprogrammes": "daily programmes",
-            "telegrammessages": "telegram messages",
-            "criticismreports": "criticism reports",
-            "suggestionreports": "suggestion reports",
-        }
-        module_label += ", " + ", ".join(pretty.get(m, m) for m in extra_modules)
-
-    window_label = f"last {days} day(s)" if days else "all time"
-    prompt = (
-        f"{SYSTEM_PROMPT}\n\n"
-        f"=== DATABASE CONTEXT — {module_label} ({window_label}) ===\n"
-        f"{context_block}\n"
-        f"=== END CONTEXT ===\n\n"
-        f"User question: {question}\n\n"
-        f"OUTPUT REQUIREMENTS — read carefully:\n"
-        f"• Your answer MUST be at least 10 lines (target 15–25 lines, ~250+ words). "
-        f"A short reply is a failure — Commissioners need depth.\n"
-        f"• Use ALL record types above (ALERT, GRIEVANCE, EVENT, DIAL-100 CALL, "
-        f"PERSON OF INTEREST, KEYWORD, MONITORED PROFILE, CONTENT, DAILY PROGRAMME, "
-        f"TELEGRAM MSG, CRITICISM/SUGGESTION REPORT) — not just alerts and grievances.\n"
-        f"• For EVERY post/alert/grievance/content/telegram you mention, append "
-        f"`[View Post](URL)` using the URL/content_url/post_link/Link field from "
-        f"the context. If no URL exists for that record, write '_(no URL on file)_'.\n"
-        f"• For EVERY monitored profile, POI, or @handle you mention, append "
-        f"`[Profile](PROFILE_URL)` using the 'Profile URL' line from the context.\n"
-        f"• Always include a final '**Links & profiles**' section that re-lists "
-        f"every clickable URL grouped by type (Posts, Profiles, Reports), so the "
-        f"officer can copy them in one place.\n"
-        f"• Cite exact numbers, handles, FIRs, codes, locations from the context — "
-        f"never invent data. If the context has no relevant records for the question, "
-        f"say so in one line and then provide a 10+ line briefing using domain "
-        f"knowledge labelled _(General:…)_.\n\nAnswer:"
-    )
-    answer = _llm_answer(prompt)
-    # Belt-and-braces: if the LLM still produced too short an answer, append the
-    # raw evidence bundle so the officer at least sees the records and links.
-    answer = _ensure_minimum_answer(answer, db_snippets, question)
-
-    # Expose previews from every record type, not just the first 6 alerts —
-    # so the UI can show officers which module each citation came from.
-    sources = []
-    for i, s in enumerate(db_snippets[:10]):
-        # First token in each snippet is "[ALERT", "[GRIEVANCE", "[EVENT", etc.
-        tag = s.split("|", 1)[0].lstrip("[").strip().lower() or "record"
-        sources.append({
-            "collection": tag,
-            "document_id": f"db-{i+1}",
-            "score": 1.0,
-            "preview": s[:200],
+    vec_list = []
+    for i, hit in enumerate(_vector_candidates(question)):
+        meta_h = hit.get("metadata", {})
+        vec_list.append({
+            "text": (f"[VEC · id={meta_h.get('document_id', '')} "
+                     f"· src={meta_h.get('source_collection', '')} "
+                     f"· score={hit.get('score', 0):.2f}]\n"
+                     f"{hit.get('text', '')[:900]}"),
+            "origin": "vector",
+            "rank": i,
+            "cosine": float(hit.get("score") or 0.0),
+            "document_id": meta_h.get("document_id", ""),
+            "source_collection": meta_h.get("source_collection", ""),
         })
 
-    return {
+    candidates: list = []
+    for lst in (db_list, vec_list):
+        for item in lst:
+            item["score"] = 1.0 / (RRF_K + item["rank"] + 1)
+            candidates.append(item)
+    # Interleave so the selector sees both retrievers' best first even when one
+    # list is much longer than the other.
+    candidates.sort(key=lambda c: (-c["score"], c["origin"]))
+    log["db_candidates"] = len(db_list)
+    log["vector_candidates"] = len(vec_list)
+    log["candidates"] = len(candidates)
+
+    # ── budget: the RAG ceiling, or whatever the endpoint can take today ─────
+    instructions_allowance = 600
+    fixed = (intent_router.count_tokens(SYSTEM_PROMPT)
+             + intent_router.count_tokens(question)
+             + instructions_allowance)
+    ctx_budget = max(512, min(
+        intent_router.MAX_CONTEXT_TOKENS,
+        llm_client.prompt_budget(_RAG_COMPLETION_TOKENS) - fixed,
+    ))
+
+    selection = intent_router.select_context(
+        candidates, max_tokens=ctx_budget,
+        complex_question=verdict.complex_question,
+        soft_max=verdict.suggested_contexts,
+    )
+    log["contexts"] = len(selection.items)
+    log["context_tokens"] = selection.tokens
+
+    if selection.items:
+        context_block = "\n\n---\n\n".join(c["text"] for c in selection.items)
+    else:
+        context_block = "(No records found across the queried modules for this time window.)"
+
+    window_label = f"last {days} day(s)" if days else "all time"
+    guardrail = (intent_router.capability_guardrail(verdict.unsupported)
+                 if verdict.unsupported else "")
+
+    prompt = (
+        f"{SYSTEM_PROMPT}\n\n"
+        f"=== DATABASE CONTEXT ({window_label}) ===\n"
+        f"{context_block}\n"
+        f"=== END CONTEXT ===\n\n"
+        f"User question: {question}\n"
+        f"{guardrail}\n"
+        f"OUTPUT REQUIREMENTS — read carefully:\n"
+        f"• Answer ONLY from the DATABASE CONTEXT above. Every number, handle, "
+        f"FIR, location and URL must appear in that context.\n"
+        f"• Never invent records, counts, names or links. Do not fill gaps with "
+        f"general knowledge or assumptions.\n"
+        f"• If the context does not contain enough information to answer, say so "
+        f"plainly in one or two lines — that is a correct answer, not a failure. "
+        f"Do not pad it out.\n"
+        f"• For every record you cite, append `[View Post](URL)` using that "
+        f"record's URL field. If it has none, write `_(no URL on file)_`.\n"
+        f"• Length should match the evidence: brief when the context is thin, "
+        f"fuller when it is rich.\n\nAnswer:"
+    )
+    log["prompt_tokens"] = intent_router.count_tokens(prompt)
+
+    meta = {}
+    answer = llm_generate(prompt, temperature=0.2, top_p=0.9,
+                          max_tokens=_RAG_COMPLETION_TOKENS, meta=meta)
+    log["llm_status"] = meta.get("status")
+    if meta.get("prompt_tokens"):
+        log["prompt_tokens"] = meta["prompt_tokens"]
+
+    # Capability boundary is stated in code, not left to the model — it cannot
+    # talk its way into claiming it emailed or exported anything.
+    if verdict.unsupported:
+        answer = (intent_router.limitation_notice(verdict.unsupported,
+                                                  data_follows=True)
+                  + "\n\n" + answer)
+
+    # Only rescue the answer when the LLM actually failed. A short, grounded
+    # reply is now a valid outcome, so it is no longer padded.
+    answer = _ensure_minimum_answer(answer, db_snippets, question)
+
+    sources = []
+    for i, item in enumerate(selection.items):
+        text = item["text"]
+        if item["origin"] == "vector":
+            collection = item.get("source_collection") or "vector"
+            document_id = item.get("document_id") or f"vec-{i + 1}"
+        else:
+            collection = text.split("|", 1)[0].lstrip("[").strip().lower() or "record"
+            document_id = f"db-{i + 1}"
+        sources.append({
+            "collection": collection,
+            "document_id": document_id,
+            "score": round(float(item.get("score") or 0.0), 4),
+            "preview": text[:200],
+        })
+
+    return _finish({
         "answer": answer, "sources": sources, "question": question,
         "scope": "db_direct+vec", "window_doc_count": db_doc_count,
         "time_window_days": days,
-    }
+        "candidates_considered": selection.considered,
+        "dropped_by_budget": selection.dropped_by_budget,
+        "dropped_by_relevance": selection.dropped_by_relevance,
+    })
 
 
 @app.post("/api/rag/query")
@@ -1199,6 +1281,15 @@ def query(req: QueryRequest):
     """
     if not req.use_db:
         return _chat_only_answer(req.question)
+
+    # Greetings, capability questions and pure unsupported-action requests are
+    # answered the same way whatever collection is selected — and must never
+    # trigger retrieval. _global_query owns those branches.
+    if not intent_router.classify(req.question).needs_rag:
+        out = _global_query(req.question, req.top_k, req.time_window_days)
+        out["time_window_days"] = req.time_window_days
+        return out
+
     raw_col = (req.collection or "").strip().lower()
     if raw_col in ("", "all", "*", "global", "everything"):
         out = _global_query(req.question, req.top_k, req.time_window_days)
@@ -1221,9 +1312,7 @@ def query(req: QueryRequest):
         raise HTTPException(status_code=500, detail=f"MongoDB error: {e}")
 
     bot = Assistant(
-        ollama_base_url=OLLAMA_BASE_URL,
-        llm_model=OLLAMA_LLM_MODEL,
-        embed_model=OLLAMA_EMBED_MODEL,
+        llm_model=LLM_MODEL,
         mongo_uri=MONGODB_URI,
         db_name=DB_NAME,
         vector_collection=vec_col,
@@ -1279,7 +1368,7 @@ def _jobs_col():
 
 # Max source docs to auto-ingest inline (blocks the query until done).
 # Collections larger than this are ingested in the background so the query
-# doesn't hang for minutes while Ollama embeds thousands of docs.
+# doesn't hang for minutes while the embedding server processes thousands of docs.
 AUTO_INGEST_INLINE_LIMIT = int(os.getenv("AUTO_INGEST_INLINE_LIMIT", "500"))
 
 # Track background ingestion so we don't launch duplicates
@@ -1441,10 +1530,8 @@ def _process_job(job_id: str, question: str, collection: str, top_k: int,
             return
 
         bot = Assistant(
-            ollama_base_url=OLLAMA_BASE_URL,
-            llm_model=OLLAMA_LLM_MODEL,
-            embed_model=OLLAMA_EMBED_MODEL,
-            mongo_uri=MONGODB_URI,
+                llm_model=LLM_MODEL,
+                mongo_uri=MONGODB_URI,
             db_name=DB_NAME,
             vector_collection=vec_col,
             top_k=top_k,
@@ -1617,84 +1704,175 @@ def _record_run(doc: dict):
         logger.warning("Could not persist ingest run record: %s", e)
 
 
-def _run_ingest(collection: str) -> dict:
-    """Incrementally ingest new docs from a source collection into its vector store.
+def _content_hash(text: str) -> str:
+    """Stable fingerprint of a document's retrievable text."""
+    return hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()
 
-    Skips documents whose `_id` is already embedded, so it's safe to call repeatedly
-    (e.g. on a schedule) — only new data hits Ollama.
+
+def _embedded_state(store) -> dict:
+    """Map document_id -> content hash recorded when it was embedded.
+
+    Skipping purely on "have I seen this _id" leaves an edited document stuck
+    on its original vector forever. Storing the hash lets the sync tell a
+    genuinely new document apart from a changed one.
+    """
+    col = store.connect()
+    state = {}
+    for row in col.find({}, {"metadata.document_id": 1,
+                             "metadata.content_hash": 1}):
+        meta = row.get("metadata") or {}
+        did = meta.get("document_id")
+        if did is not None:
+            state[did] = meta.get("content_hash")
+    return state
+
+
+def _run_ingest(collection: str) -> dict:
+    """Incrementally sync one source collection into its vector store.
+
+    Three outcomes per source document:
+      * unseen _id            -> embed it
+      * seen, hash unchanged  -> skip (no embedding call)
+      * seen, hash changed    -> re-embed and replace only that document's chunks
+
+    Safe to call repeatedly on a schedule: unchanged data never reaches the
+    embedding model.
     """
     vec_col = f"{VECTOR_COLLECTION}_{collection}"
-    logger.info("Ingestion start: '%s' → '%s'", collection, vec_col)
+    logger.info("Sync start: '%s' -> '%s'", collection, vec_col)
 
-    streamer = MongoStreamProcessor(MONGODB_URI, DB_NAME, collection, BATCH_SIZE)
     converter = DocumentConverter()
-    chunker = TokenAwareChunker(min_tokens=CHUNK_MIN, max_tokens=CHUNK_MAX, overlap=CHUNK_OVERLAP)
-    embedder = OllamaEmbedder(OLLAMA_BASE_URL, OLLAMA_EMBED_MODEL)
+    chunker = TokenAwareChunker(min_tokens=CHUNK_MIN, max_tokens=CHUNK_MAX,
+                                overlap=CHUNK_OVERLAP)
+    embedder = get_embedder()
     store = VectorStore(MONGODB_URI, DB_NAME, vec_col)
 
     if not embedder.check_health():
         store.close()
-        raise RuntimeError("Ollama embedding model not available")
+        raise RuntimeError("local embedding model not available")
 
-    already_done = store.get_embedded_doc_ids()
-    total_docs = streamer.count_documents()
+    known = _embedded_state(store)
 
-    docs_processed = 0
-    chunks_stored = 0
-    embed_failures = 0
-    pending = []
+    client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+    src = client[DB_NAME][collection]
+    total_docs = src.estimated_document_count()
 
-    for doc in streamer.stream_documents(skip_ids=already_done):
-        doc_id = str(doc.get("_id", ""))
-        text = converter.convert(doc)
-        if not text.strip():
-            continue
+    docs_new = docs_changed = docs_skipped = docs_legacy = 0
+    chunks_stored = embed_failures = 0
+    failed_docs: list = []
+    pending: list = []
 
-        doc_chunks = chunker.chunk_document(text, collection, doc_id)
-        for chunk in doc_chunks:
-            embedding = embedder.embed_text(chunk.text)
-            if embedding is None:
-                embed_failures += 1
-                continue
-            pending.append({
-                "text": chunk.text,
-                "embedding": embedding,
-                "metadata": {
-                    "source_collection": chunk.metadata.source_collection,
-                    "document_id": chunk.metadata.document_id,
-                    "chunk_index": chunk.metadata.chunk_index,
-                    "total_chunks": chunk.metadata.total_chunks,
-                },
-            })
-
-        docs_processed += 1
-        if len(pending) >= BATCH_SIZE:
+    def _flush():
+        nonlocal pending, chunks_stored
+        if pending:
             chunks_stored += store.upsert_chunks(pending)
             pending = []
 
-    if pending:
-        chunks_stored += store.upsert_chunks(pending)
+    for doc in src.find({}):
+        doc_id = str(doc.get("_id", ""))
+        try:
+            text = converter.convert(doc)
+            if not text.strip():
+                continue
 
-    # Invalidate the local numpy cache so the next query picks up newly ingested chunks.
-    if docs_processed > 0:
+            digest = _content_hash(text)
+            if doc_id in known:
+                recorded = known[doc_id]
+                if recorded is None:
+                    # Legacy vector written before hash tracking existed. Absence
+                    # of a hash is NOT evidence the source changed, so treating it
+                    # as "changed" would delete and re-embed the entire existing
+                    # corpus on the first scheduled cycle. Migrating those is a
+                    # deliberate rebuild (regenerate_embeddings.py), not something
+                    # a sync should do on a timer.
+                    docs_legacy += 1
+                    continue
+                if recorded == digest:
+                    docs_skipped += 1
+                    continue
+                # Content changed: drop the stale chunks first, so a document
+                # that now produces fewer chunks does not leave orphans behind.
+                store.connect().delete_many({"metadata.document_id": doc_id})
+                docs_changed += 1
+            else:
+                docs_new += 1
+
+            chunks = chunker.chunk_document(text, collection, doc_id)
+            if not chunks:
+                continue
+
+            # Document side must carry the document prefix. Using the query
+            # prefix here would put the corpus in a different region of the
+            # space from the questions asked against it.
+            vectors = embedder.embed_documents([c.text for c in chunks])
+
+            wrote_any = False
+            for chunk, vec in zip(chunks, vectors):
+                if vec is None:
+                    embed_failures += 1
+                    continue
+                wrote_any = True
+                pending.append({
+                    "text": chunk.text,
+                    "embedding": vec,
+                    "metadata": {
+                        "source_collection": chunk.metadata.source_collection,
+                        "document_id": chunk.metadata.document_id,
+                        "chunk_index": chunk.metadata.chunk_index,
+                        "total_chunks": chunk.metadata.total_chunks,
+                        "chunk_id": f"{doc_id}::{chunk.metadata.chunk_index}",
+                        "content_hash": digest,
+                        "embed_model": getattr(embedder, "model_name", None),
+                        "embed_dim": len(vec),
+                        "source_created_at": doc.get("created_at"),
+                    },
+                })
+            if not wrote_any:
+                failed_docs.append(doc_id)
+
+            if len(pending) >= BATCH_SIZE:
+                _flush()
+
+        except Exception as exc:
+            # One bad document must not take the worker down; record it so the
+            # next cycle retries it (its hash was never stored).
+            embed_failures += 1
+            failed_docs.append(doc_id)
+            logger.warning("Sync: document %s in %s failed: %s",
+                           doc_id, collection, str(exc)[:160])
+
+    _flush()
+    client.close()
+
+    docs_processed = docs_new + docs_changed
+    if docs_processed:
         store.invalidate_cache()
-        logger.info("Invalidated vector cache for '%s' after ingesting %d new docs.", vec_col, docs_processed)
-
+        logger.info("Invalidated vector cache for '%s' after %d changes.",
+                    vec_col, docs_processed)
     store.close()
+
+    logger.info("Sync done: %s — new=%d changed=%d unchanged=%d legacy=%d "
+                "chunks=%d failures=%d", collection, docs_new, docs_changed,
+                docs_skipped, docs_legacy, chunks_stored, embed_failures)
+    if docs_legacy:
+        logger.info("  %s: %d document(s) hold pre-hash vectors and were left "
+                    "alone. Rebuild them with regenerate_embeddings.py when you "
+                    "choose to migrate.", collection, docs_legacy)
 
     result = {
         "collection": collection,
         "vector_collection": vec_col,
         "total_source_docs": total_docs,
         "docs_processed": docs_processed,
+        "docs_new": docs_new,
+        "docs_changed": docs_changed,
+        "docs_skipped": docs_skipped,
+        "docs_legacy": docs_legacy,
+        "failed_document_ids": failed_docs[:50],
         "chunks_stored": chunks_stored,
         "embed_failures": embed_failures,
-        "skipped_already_done": len(already_done),
+        "skipped_already_done": docs_skipped,
     }
-    logger.info(
-        "Ingestion done: '%s' — new_docs=%d new_chunks=%d failures=%d (skipped %d already-embedded)",
-        collection, docs_processed, chunks_stored, embed_failures, len(already_done),
-    )
     return result
 
 
@@ -1765,7 +1943,7 @@ def _scheduler_loop():
     First cycle runs ~30 seconds after startup so the API is responsive immediately.
     """
     interval_s = max(60.0, INGEST_INTERVAL_HOURS * 3600.0)
-    # Initial delay so we don't hammer Mongo/Ollama on a cold boot
+    # Initial delay so we don't hammer Mongo/vLLM on a cold boot
     initial_delay = 30.0
     _scheduler_state["next_run_at"] = (
         datetime.now(timezone.utc).timestamp() + initial_delay
@@ -1804,6 +1982,27 @@ def _start_scheduler():
             "Ingestion scheduler started — every %.2fh for collections: %s",
             INGEST_INTERVAL_HOURS, ", ".join(INGEST_COLLECTIONS),
         )
+
+
+@app.on_event("startup")
+def _on_startup_embedder():
+    """Download (if missing) and load the embedding model at boot.
+
+    Runs on a background thread so the API starts serving immediately: on a
+    fresh deploy the first load is a ~520 MB download, and blocking startup on
+    it would make the service look dead. Until it finishes, embedding-backed
+    routes degrade rather than hang, and /api/rag/health reports the state.
+    """
+    if os.getenv("EMBED_WARMUP", "true").lower() not in ("1", "true", "yes", "on"):
+        logger.info("Embedding warm-up disabled via EMBED_WARMUP.")
+        return
+
+    def _warm():
+        import embedder as _embedder
+        _EMBED_WARMUP.update(_embedder.warmup())
+
+    threading.Thread(target=_warm, name="embed-warmup", daemon=True).start()
+    logger.info("Embedding model warm-up started in the background.")
 
 
 @app.on_event("startup")
@@ -2089,19 +2288,15 @@ def _build_dsr(force: bool = False) -> dict:
 
     llm_summary = ""
     try:
-        resp = requests.post(
-            f"{OLLAMA_BASE_URL.rstrip('/')}/api/generate",
-            json={
-                "model": OLLAMA_LLM_MODEL, "prompt": prompt, "stream": False,
-                "options": {"temperature": 0.2, "num_ctx": 8192, "num_predict": 1200},
-            },
+        llm_summary = llm_generate(
+            prompt,
+            temperature=0.2,
+            max_tokens=1200,
             timeout=600,
         )
-        resp.raise_for_status()
-        llm_summary = resp.json().get("response", "").strip()
     except Exception as exc:
         logger.warning("DSR LLM generation failed: %s", exc)
-        llm_summary = "_(LLM briefing unavailable — Ollama not reachable.)_"
+        llm_summary = "_(LLM briefing unavailable — vLLM not reachable.)_"
 
     # Build the final markdown: stats header + LLM briefing
     header = textwrap.dedent(f"""\
@@ -2200,7 +2395,7 @@ def _start_dsr_scheduler():
 # ---------------------------------------------------------------------------
 # Top-50 Alerts endpoint
 #
-# Fetches all alerts from the last 24 hours, sends them to Ollama, which
+# Fetches all alerts from the last 24 hours, sends them to the vLLM LLM, which
 # ranks and returns the top 50 most important unique alerts for police review.
 # Each returned alert carries the original MongoDB document id so the frontend
 # can render it with the existing AlertCard flow (acknowledge / escalate / etc.)
@@ -2213,7 +2408,7 @@ class TopAlertsRequest(BaseModel):
 
 @app.post("/api/rag/top-alerts")
 def top_alerts(req: TopAlertsRequest):
-    """Fetch all alerts from the last N hours, ask Ollama to rank the top-50
+    """Fetch all alerts from the last N hours, ask the vLLM LLM to rank the top-50
     unique most-important ones, and return them with full document data."""
     hours = max(1, min(req.hours, 168))   # clamp 1h–7d
     top_n = max(1, min(req.top_n, 100))
@@ -2234,7 +2429,7 @@ def top_alerts(req: TopAlertsRequest):
         return {"alerts": [], "total_scanned": 0, "hours": hours,
                 "message": f"No alerts found in the last {hours} hour(s)."}
 
-    # Build a compact index for Ollama (id → snippet)
+    # Build a compact index for the LLM (id → snippet)
     # Deduplicate by author_handle to avoid flooding with the same source
     seen_handles: set = set()
     candidates: list = []   # (doc, snippet) pairs
@@ -2268,7 +2463,7 @@ def top_alerts(req: TopAlertsRequest):
 
     total_unique = len(candidates)
 
-    # Build Ollama prompt
+    # Build the LLM prompt
     candidates_text = "\n".join(s for _, s, _ in candidates)
     prompt = textwrap.dedent(f"""\
         You are a Telangana Police SOC analyst. Below are {total_unique} unique alerts
@@ -2292,20 +2487,14 @@ def top_alerts(req: TopAlertsRequest):
     """)
 
     try:
-        resp = requests.post(
-            f"{OLLAMA_BASE_URL.rstrip('/')}/api/generate",
-            json={
-                "model": OLLAMA_LLM_MODEL,
-                "prompt": prompt,
-                "stream": False,
-                "options": {"temperature": 0.0, "num_ctx": 8192, "num_predict": 2048},
-            },
+        raw_response = llm_generate(
+            prompt,
+            temperature=0.0,
+            max_tokens=2048,
             timeout=300,
         )
-        resp.raise_for_status()
-        raw_response = resp.json().get("response", "").strip()
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Ollama error: {e}")
+        raise HTTPException(status_code=503, detail=f"LLM error: {e}")
 
     # Parse the JSON array from the LLM response
     import json as _json
@@ -2416,7 +2605,7 @@ def top_alerts(req: TopAlertsRequest):
 #
 # Returns up to `top_n_per_category` LLM-ranked alerts for EACH source_category
 # (communal, political, defamation, narcotics, history_sheeters, trouble_makers,
-# others). Ollama is called once per category in parallel.
+# others). The LLM is called once per category in parallel.
 # ---------------------------------------------------------------------------
 
 CATEGORY_KEYS = [
@@ -2431,12 +2620,12 @@ class TopAlertsByCategoryRequest(BaseModel):
     categories: Optional[list] = None  # restrict to a subset; default = all
 
 
-def _rank_category_via_ollama(category: str, candidates: list, top_n: int, hours: int) -> list:
-    """Call Ollama once for a single category and return ranked uuid IDs,
+def _rank_category_via_llm(category: str, candidates: list, top_n: int, hours: int) -> list:
+    """Call the vLLM LLM once for a single category and return ranked uuid IDs,
     up to min(top_n, len(candidates)). After the LLM picks, pad with
     priority+risk-score sorted candidates not already chosen so the result
     always fills available capacity. Falls back fully to rule-based ranking
-    if Ollama is unreachable or returns nothing parseable."""
+    if the LLM is unreachable or returns nothing parseable."""
     if not candidates:
         return []
 
@@ -2482,26 +2671,19 @@ def _rank_category_via_ollama(category: str, candidates: list, top_n: int, hours
 
     ranked_ids: list = []
     try:
-        resp = requests.post(
-            f"{OLLAMA_BASE_URL.rstrip('/')}/api/generate",
-            json={
-                "model": OLLAMA_LLM_MODEL,
-                "prompt": prompt,
-                "stream": False,
-                # 4096 predict tokens fits ~50 UUIDs comfortably
-                "options": {"temperature": 0.0, "num_ctx": 8192, "num_predict": 4096},
-            },
+        raw = llm_generate(
+            prompt,
+            temperature=0.0,
+            max_tokens=4096,
             timeout=300,
         )
-        resp.raise_for_status()
-        raw = resp.json().get("response", "").strip()
         import json as _json
         # Greedy match so a [..] containing newlines is captured whole
         match = re.search(r"\[.*\]", raw, re.DOTALL)
         if match:
             ranked_ids = _json.loads(match.group(0))
     except Exception as e:
-        logger.warning("Ollama ranking failed for category=%s: %s", category, e)
+        logger.warning("LLM ranking failed for category=%s: %s", category, e)
 
     # Keep only valid IDs (the LLM occasionally hallucinates), de-dup
     valid_ids = {uid for _, _, uid in candidates}
@@ -2528,7 +2710,7 @@ def _rank_category_via_ollama(category: str, candidates: list, top_n: int, hours
 
 @app.post("/api/rag/top-alerts/by-category")
 def top_alerts_by_category(req: TopAlertsByCategoryRequest):
-    """For each source_category, ask Ollama to rank the top-N most important
+    """For each source_category, ask the vLLM LLM to rank the top-N most important
     alerts. Runs categories in parallel for latency. Returns a flat list of
     ranked alerts (preserving per-category internal order) plus per-category
     counts and breakdown."""
@@ -2596,12 +2778,12 @@ def top_alerts_by_category(req: TopAlertsByCategoryRequest):
 
     total_unique = sum(len(b) for b in buckets.values())
 
-    # Rank each category in parallel via Ollama
+    # Rank each category in parallel via the LLM
     ranked_by_cat: dict = {}
     cats_to_rank = [(c, items) for c, items in buckets.items() if items]
     with ThreadPoolExecutor(max_workers=min(4, len(cats_to_rank) or 1)) as ex:
         futures = {
-            ex.submit(_rank_category_via_ollama, cat, items, top_n, hours): cat
+            ex.submit(_rank_category_via_llm, cat, items, top_n, hours): cat
             for cat, items in cats_to_rank
         }
         for fut in as_completed(futures):
@@ -3359,19 +3541,15 @@ def _build_dir(hours: int = 24, force: bool = False) -> dict:
 
     llm_summary = ""
     try:
-        resp = requests.post(
-            f"{OLLAMA_BASE_URL.rstrip('/')}/api/generate",
-            json={
-                "model": OLLAMA_LLM_MODEL, "prompt": prompt, "stream": False,
-                "options": {"temperature": 0.15, "num_ctx": 8192, "num_predict": 1800},
-            },
+        llm_summary = llm_generate(
+            prompt,
+            temperature=0.15,
+            max_tokens=1800,
             timeout=600,
         )
-        resp.raise_for_status()
-        llm_summary = resp.json().get("response", "").strip()
     except Exception as exc:
         logger.warning("DIR LLM generation failed: %s", exc)
-        llm_summary = "_(AI narrative unavailable — Ollama not reachable.)_"
+        llm_summary = "_(AI narrative unavailable — vLLM not reachable.)_"
 
     doc = {
         "cache_key":   cache_key,

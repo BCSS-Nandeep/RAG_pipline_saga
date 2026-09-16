@@ -1,9 +1,27 @@
--r osint_portal/requirements.txt
-
+# Core
 pymongo>=4.6.0
-tiktoken>=0.6.0
-numpy>=1.26.0
-requests>=2.31.0
 python-dotenv>=1.0.0
+requests>=2.31.0
+numpy>=1.26.0
+tiktoken>=0.6.0
+tqdm>=4.66.0
+
+# API
 fastapi>=0.110.0
 uvicorn>=0.27.0
+
+# Local embedding model (nomic-ai/nomic-embed-text-v1.5)
+# torch is NOT pinned here on purpose: the CUDA build must match the host's
+# driver, and the CPU wheel on PyPI would silently disable GPU embedding.
+# Install it first, from the index matching your CUDA version, e.g.
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+# Verify with: python -c "import torch; print(torch.cuda.is_available())"
+torch>=2.4
+transformers>=4.40
+einops>=0.7            # required by Nomic's trust_remote_code module
+safetensors>=0.4
+huggingface_hub>=0.23
+
+# The osint_portal sub-application is not vendored in this repo. api_server.py
+# mounts it when importable and runs without it otherwise, so its requirements
+# are not pulled in here.

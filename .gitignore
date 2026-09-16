@@ -3,12 +3,22 @@
 .env.*
 !.env.example
 
+# Backups & scratch
+*.bak
+*.orig
+*.tmp
+
 # Logs & runtime output
 *.log
 reports/
+.vector_cache/
+.ingest_checkpoint.json
 
 # Python
 __pycache__/
 *.py[cod]
 .venv/
 venv/
+
+# Model cache (weights are downloaded on first run)
+.cache/

@@ -4,7 +4,7 @@ pipeline.py — CLI entry point and orchestrator for the RAG pipeline.
 Usage:
     python pipeline.py --ingest              # Run stages 1–5 (stream → embed → store)
     python pipeline.py --query "question"    # Run stage 6  (ask the AI assistant)
-    python pipeline.py --check               # Verify MongoDB + Ollama connectivity
+    python pipeline.py --check               # Verify MongoDB + vLLM connectivity
     python pipeline.py --stats               # Show collection & vector store stats
 """
 
@@ -20,9 +20,10 @@ from tqdm import tqdm
 
 from processor import MongoStreamProcessor, DocumentConverter
 from chunker import TokenAwareChunker
-from embedder import OllamaEmbedder
+from embedder import get_embedder
 from vector_store import VectorStore
 from assistant import Assistant
+import llm_client
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -33,9 +34,6 @@ load_dotenv()
 MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
 DB_NAME = os.getenv("DB_NAME", "your_db")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "your_collection")
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_LLM_MODEL = os.getenv("OLLAMA_LLM_MODEL", "qwen2.5:7b")
-OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
 VECTOR_COLLECTION = os.getenv("VECTOR_COLLECTION", "vector_embeddings")
 
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "500"))
@@ -63,7 +61,7 @@ logger = logging.getLogger("pipeline")
 # ---------------------------------------------------------------------------
 
 def run_health_check() -> bool:
-    """Verify MongoDB and Ollama (both embedding + LLM models) are reachable."""
+    """Verify MongoDB and both self-hosted vLLM services are reachable."""
     ok = True
 
     # MongoDB
@@ -82,29 +80,25 @@ def run_health_check() -> bool:
         logger.error("  MongoDB FAILED: %s", exc)
         ok = False
 
-    # Ollama — embedding model
-    logger.info("Checking Ollama embedding model '%s' at %s ...", OLLAMA_EMBED_MODEL, OLLAMA_BASE_URL)
-    embed_ok = OllamaEmbedder(OLLAMA_BASE_URL, OLLAMA_EMBED_MODEL).check_health()
-    if not embed_ok:
+    # Embedding service — verify the vector width, not just reachability
+    logger.info("Checking the vLLM embedding server ...")
+    emb = get_embedder().probe()
+    logger.info("  Embedding        : %s", "HEALTHY" if emb["healthy"] else "UNHEALTHY")
+    logger.info("  Embedding model  : %s", emb["model"])
+    logger.info("  Embedding dim    : %s (corpus expects %s)",
+                emb["dimension"], emb["expected_dimension"])
+    if emb["error"]:
+        logger.error("  Embedding error  : %s", emb["error"])
+    if not emb["healthy"]:
         ok = False
 
-    # Ollama — LLM model
-    logger.info("Checking Ollama LLM model '%s' at %s ...", OLLAMA_LLM_MODEL, OLLAMA_BASE_URL)
-    import requests
-    try:
-        resp = requests.get(f"{OLLAMA_BASE_URL.rstrip('/')}/api/tags", timeout=10)
-        resp.raise_for_status()
-        models = [m["name"] for m in resp.json().get("models", [])]
-        if any(OLLAMA_LLM_MODEL in m for m in models):
-            logger.info("  LLM model '%s' available.", OLLAMA_LLM_MODEL)
-        else:
-            logger.error(
-                "  LLM model '%s' NOT found. Available: %s. Run: ollama pull %s",
-                OLLAMA_LLM_MODEL, models, OLLAMA_LLM_MODEL,
-            )
-            ok = False
-    except Exception as exc:
-        logger.error("  Ollama LLM check FAILED: %s", exc)
+    # LLM — OpenAI-compatible endpoint (vLLM), not Ollama
+    logger.info("Checking LLM model '%s' at %s ...",
+                llm_client.LLM_MODEL, llm_client.LLM_BASE_URL)
+    llm_ok = llm_client.check_health()
+    logger.info("  LLM              : %s", "HEALTHY" if llm_ok else "UNHEALTHY")
+    logger.info("  LLM model        : %s", llm_client.LLM_MODEL)
+    if not llm_ok:
         ok = False
 
     return ok
@@ -150,7 +144,7 @@ def run_ingestion(full: bool = False):
     Each batch:
       1. Fetches BATCH_SIZE docs from MongoDB (sorted by _id, paginated)
       2. Converts + chunks them
-      3. Embeds all chunks in one batch call to Ollama
+      3. Embeds all chunks in one batch call to the vLLM embedding server
       4. Stores in vector DB
       5. Saves a checkpoint file
 
@@ -166,12 +160,12 @@ def run_ingestion(full: bool = False):
     streamer = MongoStreamProcessor(MONGODB_URI, DB_NAME, COLLECTION_NAME, BATCH_SIZE)
     converter = DocumentConverter()
     chunker = TokenAwareChunker(min_tokens=CHUNK_MIN, max_tokens=CHUNK_MAX, overlap=CHUNK_OVERLAP)
-    embedder = OllamaEmbedder(OLLAMA_BASE_URL, OLLAMA_EMBED_MODEL)
+    embedder = get_embedder()
     store = VectorStore(MONGODB_URI, DB_NAME, VECTOR_COLLECTION)
 
     # Pre-flight
     if not embedder.check_health():
-        logger.error("Ollama embedding model not available — aborting.")
+        logger.error("vLLM embedding server not available — aborting.")
         sys.exit(1)
 
     total_docs = streamer.count_documents()
@@ -307,9 +301,7 @@ def run_ingestion(full: bool = False):
 def run_query(question: str):
     """Ask the AI assistant a question."""
     bot = Assistant(
-        ollama_base_url=OLLAMA_BASE_URL,
-        llm_model=OLLAMA_LLM_MODEL,
-        embed_model=OLLAMA_EMBED_MODEL,
+        llm_model=llm_client.LLM_MODEL,
         mongo_uri=MONGODB_URI,
         db_name=DB_NAME,
         vector_collection=VECTOR_COLLECTION,
@@ -360,7 +352,7 @@ def run_stats():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="RAG Pipeline — Ingest MongoDB data and query with Ollama Qwen",
+        description="RAG Pipeline — Ingest MongoDB data and query with vLLM Qwen3",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             Examples:
@@ -373,7 +365,7 @@ def main():
     parser.add_argument("--ingest", action="store_true", help="Run ingestion pipeline (stages 1–5)")
     parser.add_argument("--full", action="store_true", help="Force full re-ingestion (skip incremental mode)")
     parser.add_argument("--query", type=str, metavar="QUESTION", help="Ask a question (stage 6)")
-    parser.add_argument("--check", action="store_true", help="Health-check MongoDB + Ollama")
+    parser.add_argument("--check", action="store_true", help="Health-check MongoDB + vLLM services")
     parser.add_argument("--stats", action="store_true", help="Show collection stats")
     parser.add_argument("--build-cache", action="store_true", help="Build/rebuild the vector search cache")
 
