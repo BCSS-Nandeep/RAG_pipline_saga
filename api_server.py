@@ -719,6 +719,53 @@ _CATEGORY_HINTS = [
 ]
 
 # ---------------------------------------------------------------------------
+# Relevance filtering for the DB-recency pull
+#
+# _CATEGORY_HINTS above only covers ~9 fixed phrasings. Every other question
+# ("potholes", "political rally", "telegram messages", ...) fell through to
+# an unfiltered "most recent HIGH/MEDIUM alerts" query, so the SAME handful of
+# recent alerts appeared as context/sources regardless of what was asked —
+# they then tied with genuine vector hits in the RRF fusion below and rode
+# along into the answer. _extract_relevance_terms + _relevance_or_clause keep
+# that recency pull on-topic by requiring the question's own content words to
+# appear somewhere in the candidate record; the unfiltered pull remains as a
+# fallback only when nothing on-topic exists, so a broad or truly generic
+# question still gets real data instead of an empty context block.
+# ---------------------------------------------------------------------------
+_RELEVANCE_STOPWORDS = _COUNT_FILLER | frozenset(
+    "recent latest current please related relating".split()
+)
+
+
+def _extract_relevance_terms(question: str) -> list:
+    """Meaningful content words from the question (order-preserved, deduped)."""
+    seen: list = []
+    for w in re.findall(r"[a-zA-Z][a-zA-Z0-9_'-]{2,}", question.lower()):
+        if w in _RELEVANCE_STOPWORDS or w in seen:
+            continue
+        seen.append(w)
+    return seen
+
+
+ALERT_RELEVANCE_FIELDS = [
+    "title", "source_category", "alert_type", "classification_explanation",
+    "matched_keywords_normalized", "author_handle", "author",
+]
+GRIEVANCE_RELEVANCE_FIELDS = [
+    "content.text", "context.in_reply_to.content.text", "tagged_account",
+    "posted_by.handle", "complaint_code",
+]
+
+
+def _relevance_or_clause(terms: list, fields: list) -> Optional[dict]:
+    """`$or` regex clause matching any *fields* against any *terms*, or None."""
+    if not terms:
+        return None
+    term_re = "|".join(re.escape(t) for t in terms[:12])  # cap — very long questions
+    return {"$or": [{f: {"$regex": term_re, "$options": "i"}} for f in fields]}
+
+
+# ---------------------------------------------------------------------------
 # Field projections & formatters for ALL additional modules
 # ---------------------------------------------------------------------------
 
@@ -1063,32 +1110,51 @@ def _build_db_context(question: str, window_days: Optional[int], limit_per: int 
         q_lower = question.lower()
         is_trending = any(w in q_lower for w in ["trending", "viral", "hot topic", "hyped", "most popular", "most talked", "top post"])
 
-        if is_trending:
-            # Pull HIGH+MEDIUM together sorted by velocity (most viral first)
-            all_alerts = list(db.alerts.find(
-                {**alert_q, "priority": {"$in": ["HIGH", "MEDIUM"]},
-                 "velocity_data.velocity": {"$gt": 0}},
-                ALERT_FIELDS
-            ).sort("velocity_data.velocity", DESCENDING).limit(limit_per))
-            # If not enough velocity data, fall back to recent high-risk
-            if len(all_alerts) < 5:
-                all_alerts = list(db.alerts.find(
-                    {**alert_q, "priority": {"$in": ["HIGH", "MEDIUM"]}}, ALERT_FIELDS
-                ).sort("created_at", DESCENDING).limit(limit_per))
-        else:
+        def _fetch_alerts(q: dict) -> list:
+            if is_trending:
+                # Pull HIGH+MEDIUM together sorted by velocity (most viral first)
+                fetched = list(db.alerts.find(
+                    {**q, "priority": {"$in": ["HIGH", "MEDIUM"]},
+                     "velocity_data.velocity": {"$gt": 0}},
+                    ALERT_FIELDS
+                ).sort("velocity_data.velocity", DESCENDING).limit(limit_per))
+                # If not enough velocity data, fall back to recent high-risk
+                if len(fetched) < 5:
+                    fetched = list(db.alerts.find(
+                        {**q, "priority": {"$in": ["HIGH", "MEDIUM"]}}, ALERT_FIELDS
+                    ).sort("created_at", DESCENDING).limit(limit_per))
+                return fetched
             # Normal: HIGH first, then MEDIUM — weighted 2:1
             high_lim = max(8, limit_per * 2 // 3)
-            med_lim  = max(4, limit_per // 3)
+            med_lim = max(4, limit_per // 3)
             alerts_high = list(db.alerts.find(
-                {**alert_q, "priority": "HIGH"}, ALERT_FIELDS
+                {**q, "priority": "HIGH"}, ALERT_FIELDS
             ).sort("created_at", DESCENDING).limit(high_lim))
             alerts_med = list(db.alerts.find(
-                {**alert_q, "priority": "MEDIUM"}, ALERT_FIELDS
+                {**q, "priority": "MEDIUM"}, ALERT_FIELDS
             ).sort("created_at", DESCENDING).limit(med_lim))
-            all_alerts = alerts_high + alerts_med
+            return alerts_high + alerts_med
 
-        # Grievances — also try keyword match on content text
+        # Relevance-scope the recency pull to the question's own content words
+        # — skipped for handle lookups (already precise) and for broad/summary
+        # questions ("overall status", "everything") that intentionally want
+        # the wide recent-alerts view.
+        relevance_terms = [] if (handle_match or _BROAD_QUESTION_RE.search(question)) \
+            else _extract_relevance_terms(question)
+        alert_relevance_clause = _relevance_or_clause(relevance_terms, ALERT_RELEVANCE_FIELDS)
+
+        scoped_alert_q = {**alert_q, **alert_relevance_clause} if alert_relevance_clause else alert_q
+        all_alerts = _fetch_alerts(scoped_alert_q)
+        if alert_relevance_clause and not all_alerts:
+            # Nothing on-topic in this window — fall back to the unfiltered
+            # recency pull so the answer still has real data; the vector layer
+            # (RRF-fused in _global_query) is what actually supplies on-topic
+            # context in this case.
+            all_alerts = _fetch_alerts(alert_q)
+
+        # Grievances — keyword match on content text; same relevance scoping
         grievance_q = {**base_q}
+        grievance_relevance_clause = None
         if handle_match:
             handle_re = "|".join(re.escape(h) for h in handle_match)
             grievance_q["$or"] = [
@@ -1096,9 +1162,18 @@ def _build_db_context(question: str, window_days: Optional[int], limit_per: int 
                 {"content.text": {"$regex": handle_re, "$options": "i"}},
                 {"tagged_account": {"$regex": handle_re, "$options": "i"}},
             ]
+        else:
+            grievance_relevance_clause = _relevance_or_clause(relevance_terms, GRIEVANCE_RELEVANCE_FIELDS)
+
+        scoped_grievance_q = ({**grievance_q, **grievance_relevance_clause}
+                              if grievance_relevance_clause else grievance_q)
         grievances = list(db.grievances.find(
-            grievance_q, GRIEVANCE_FIELDS
+            scoped_grievance_q, GRIEVANCE_FIELDS
         ).sort("created_at", DESCENDING).limit(max(6, limit_per // 2)))
+        if grievance_relevance_clause and not grievances:
+            grievances = list(db.grievances.find(
+                grievance_q, GRIEVANCE_FIELDS
+            ).sort("created_at", DESCENDING).limit(max(6, limit_per // 2)))
 
         snippets = []
         for i, d in enumerate(all_alerts, 1):
