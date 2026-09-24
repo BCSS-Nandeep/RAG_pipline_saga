@@ -25,6 +25,7 @@ continues where it stopped instead of duplicating work.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import os
 import sys
@@ -370,6 +371,11 @@ def rebuild(collections: List[str], limit: Optional[int], skip_retire: bool) -> 
                 text = converter.convert(doc)
                 if not text.strip():
                     continue
+                # Same fingerprint the API scheduler computes (sha1 of the
+                # converted document text). Without it every rebuilt vector
+                # counts as "legacy" and the scheduler skips it forever, so an
+                # edited document would stay on its original vector for good.
+                digest = hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()
                 for ch in chunker.chunk_document(text, collection, doc_id):
                     texts.append(ch.text)
                     metas.append({
@@ -379,6 +385,8 @@ def rebuild(collections: List[str], limit: Optional[int], skip_retire: bool) -> 
                         "chunk_id": f"{doc_id}::{ch.metadata.chunk_index}",
                         "total_chunks": ch.metadata.total_chunks,
                         "source_created_at": doc.get("created_at"),
+                        "content_hash": digest,
+                        "embed_model": model,
                     })
 
             ops: List[UpdateOne] = []

@@ -1,0 +1,19 @@
+[Unit]
+Description=SOC-EYE RAG API (new pipeline)
+After=network-online.target
+
+[Service]
+User=soceye
+WorkingDirectory=/opt/soceye-rag
+EnvironmentFile=/opt/soceye-rag/.env
+# Port 8101, not 8100: the existing service keeps serving /osint from 8100.
+# Flip the Node backend's RAG_API_URL to this once it is verified.
+ExecStart=/opt/soceye-rag/.venv/bin/uvicorn api_server:app --host 0.0.0.0 --port 8101
+Restart=always
+RestartSec=10
+# The embedding model loads into GPU memory at startup; give it room.
+TimeoutStartSec=300
+# One process per GPU. --workers N would load N copies of the model.
+
+[Install]
+WantedBy=multi-user.target

@@ -8,6 +8,7 @@ vector_store.py — STAGE 5
 import json
 import logging
 import os
+import threading
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -18,6 +19,33 @@ from pymongo.collection import Collection
 logger = logging.getLogger(__name__)
 
 CACHE_DIR = os.path.join(os.path.dirname(__file__), ".vector_cache")
+
+# ---------------------------------------------------------------------------
+# Cache safety limits
+# ---------------------------------------------------------------------------
+
+# Collections with more chunks than this are served exclusively via server-side
+# search (text pre-filter → $sample → brute-force).  Their vectors are never
+# accumulated in process RAM as a local numpy cache.  Override via the env var.
+CACHE_SIZE_LIMIT = int(os.getenv("CACHE_SIZE_LIMIT", "500000"))
+
+# Dimension of each stored embedding vector; must match the embedding model.
+_EMBED_DIM = int(os.getenv("EMBED_DIM", "768"))
+
+# ---------------------------------------------------------------------------
+# Per-collection build locks — prevents two threads from building the same
+# cache file simultaneously (e.g. two queries arriving after an invalidation).
+# ---------------------------------------------------------------------------
+_BUILD_LOCKS: Dict[str, threading.Lock] = {}
+_BUILD_LOCKS_MUTEX = threading.Lock()
+
+
+def _get_build_lock(collection_name: str) -> threading.Lock:
+    """Return (creating if absent) the per-collection cache-build lock."""
+    with _BUILD_LOCKS_MUTEX:
+        if collection_name not in _BUILD_LOCKS:
+            _BUILD_LOCKS[collection_name] = threading.Lock()
+        return _BUILD_LOCKS[collection_name]
 
 
 class VectorStore:
@@ -34,6 +62,9 @@ class VectorStore:
         self._embeddings: Optional[np.ndarray] = None  # (N, 768) normalized
         self._texts: List[str] = []
         self._metas: List[Dict] = []
+        # None = not yet checked; True = exceeds CACHE_SIZE_LIMIT; False = within limit.
+        self._oversized: Optional[bool] = None
+
 
     # -- connection ----------------------------------------------------------
 
@@ -159,7 +190,23 @@ class VectorStore:
 
         Uses local numpy cache if available, otherwise falls back to
         server-side MongoDB text pre-filter + local cosine re-rank.
+
+        Collections that exceed CACHE_SIZE_LIMIT always use server-side search;
+        their vectors are never loaded into process RAM as a local numpy cache.
         """
+        # Size guard: oversized collections always use server-side search.
+        # This is evaluated once per VectorStore instance and cached; subsequent
+        # calls are a single bool comparison with no network round-trip.
+        if self._is_oversized():
+            logger.debug(
+                "Collection '%s' exceeds CACHE_SIZE_LIMIT — using server-side search.",
+                self.collection_name,
+            )
+            return self._search_server_side(
+                query_vector, top_k, query_text=query_text,
+                source_collection=source_collection,
+            )
+
         # Fast path: use numpy cache if already loaded or on disk
         if self._cache_loaded or self._cache_exists_on_disk():
             return self._search_with_cache(query_vector, top_k, source_collection=source_collection)
@@ -174,6 +221,34 @@ class VectorStore:
         emb_path = os.path.join(CACHE_DIR, f"{self.collection_name}_embeddings.npy")
         meta_path = os.path.join(CACHE_DIR, f"{self.collection_name}_meta.json")
         return os.path.exists(emb_path) and os.path.exists(meta_path)
+
+    def _is_oversized(self) -> bool:
+        """Return True if this collection exceeds CACHE_SIZE_LIMIT.
+
+        The result is cached on the instance after the first MongoDB call so
+        every subsequent query is a pure in-process bool check.
+        ``invalidate_cache()`` resets this flag so a collection that shrinks
+        (or a new CACHE_SIZE_LIMIT setting) takes effect on the next access.
+        """
+        if self._oversized is None:
+            try:
+                col = self.connect()
+                n = col.estimated_document_count()
+                self._oversized = n > CACHE_SIZE_LIMIT
+                if self._oversized:
+                    logger.warning(
+                        "Collection '%s' has %d chunks which exceeds "
+                        "CACHE_SIZE_LIMIT=%d.  Local numpy cache is disabled for "
+                        "this collection; server-side search will be used instead.",
+                        self.collection_name, n, CACHE_SIZE_LIMIT,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Size check failed for '%s': %s — treating as within limit.",
+                    self.collection_name, exc,
+                )
+                self._oversized = False
+        return bool(self._oversized)
 
     def _search_with_cache(
         self,
@@ -420,8 +495,17 @@ class VectorStore:
     # -- cache management ----------------------------------------------------
 
     def _ensure_cache(self):
-        """Load the local cache into memory, building it from MongoDB if needed."""
+        """Load the local cache into memory, building it from MongoDB if needed.
+
+        If the collection exceeds CACHE_SIZE_LIMIT this method returns without
+        building anything — cosine_search already routed to server-side search
+        before calling here, so this guard is defence-in-depth only.
+        """
         if self._cache_loaded:
+            return
+
+        # Defence-in-depth size guard (primary check is in cosine_search).
+        if self._is_oversized():
             return
 
         os.makedirs(CACHE_DIR, exist_ok=True)
@@ -444,69 +528,138 @@ class VectorStore:
         self._build_cache(emb_path, meta_path)
 
     def _build_cache(self, emb_path: str, meta_path: str):
-        """Download all vectors from MongoDB in small paginated batches and save to disk."""
-        col = self.connect()
-        total = col.estimated_document_count()
-        logger.info("Downloading %d chunks from MongoDB (paginated)...", total)
+        """Download all vectors from MongoDB page-by-page and save to disk.
 
-        texts = []
-        embeds = []
-        metas = []
+        **Memory contract**: at most one PAGE_SIZE-document batch of raw floats
+        lives in Python memory during the download loop.  The full embedding
+        matrix is materialised only once — when reading the temporary raw-binary
+        file back into numpy — and is bounded by CACHE_SIZE_LIMIT because
+        collections larger than that never reach this method.
 
-        # Use _id cursor pagination to avoid long-lived cursors timing out
-        PAGE_SIZE = 500
-        last_id = None
-        count = 0
+        **Atomic guarantee**: the caller's ``emb_path`` and ``meta_path`` files
+        are replaced only after both temporary files have been fully written and
+        verified.  A crash or exception at any point leaves the previously-valid
+        cache files untouched.
 
-        while True:
-            query = {"_id": {"$gt": last_id}} if last_id else {}
-            batch = list(
-                col.find(query, {"text": 1, "embedding": 1, "metadata": 1})
-                .sort("_id", 1)
-                .limit(PAGE_SIZE)
+        **Concurrency**: only one build per collection name runs at a time.
+        A second caller finds the lock taken and returns immediately; when the
+        first caller finishes the cache is on disk and will be loaded normally.
+        """
+        lock = _get_build_lock(self.collection_name)
+        if not lock.acquire(blocking=False):
+            logger.info(
+                "Cache build for '%s' already in progress in another thread — skipping.",
+                self.collection_name,
             )
-            if not batch:
-                break
-
-            for doc in batch:
-                texts.append(doc.get("text", ""))
-                embeds.append(doc["embedding"])
-                metas.append(doc.get("metadata", {}))
-
-            last_id = batch[-1]["_id"]
-            count += len(batch)
-            if count % 5000 == 0 or count == len(batch):
-                logger.info("  Downloaded %d / %d chunks...", count, total)
-
-        logger.info("Download complete — %d chunks.", count)
-
-        if not embeds:
-            logger.warning("No embeddings found in MongoDB.")
-            self._cache_loaded = True
             return
 
-        # Normalize and save
-        mat = np.array(embeds, dtype=np.float32)
-        norms = np.linalg.norm(mat, axis=1, keepdims=True)
-        norms[norms == 0] = 1.0
-        mat = mat / norms
+        # Temp file paths — all start with the collection name so
+        # invalidate_cache() cleans them up automatically.
+        tmp_emb  = os.path.join(CACHE_DIR, f"{self.collection_name}_embeddings.tmp.npy")
+        tmp_raw  = os.path.join(CACHE_DIR, f"{self.collection_name}_embeddings.raw.tmp")
+        tmp_meta = os.path.join(CACHE_DIR, f"{self.collection_name}_meta.tmp.json")
 
-        np.save(emb_path, mat)
-        with open(meta_path, "w") as f:
-            json.dump({"texts": texts, "metas": metas}, f)
+        try:
+            col = self.connect()
+            total = col.estimated_document_count()
+            logger.info("Downloading %d chunks from MongoDB (paginated)...", total)
 
-        self._embeddings = mat
-        self._texts = texts
-        self._metas = metas
-        self._cache_loaded = True
-        logger.info("Cache built and saved — %d vectors (%s).", len(texts), emb_path)
+            # Remove any leftover temp files from a previous failed build.
+            for tmp in (tmp_emb, tmp_raw, tmp_meta):
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+
+            texts: List[str] = []
+            metas: List[Dict] = []
+            count   = 0
+            last_id = None
+            PAGE_SIZE = 500
+
+            # Stream embedding bytes page-by-page into a raw binary temp file.
+            # Each vector is normalised here so the final np.fromfile step
+            # produces a ready-to-use unit-norm matrix without a second pass.
+            with open(tmp_raw, "wb") as raw_f:
+                while True:
+                    query = {"_id": {"$gt": last_id}} if last_id is not None else {}
+                    batch = list(
+                        col.find(query, {"text": 1, "embedding": 1, "metadata": 1})
+                        .sort("_id", ASCENDING)
+                        .limit(PAGE_SIZE)
+                    )
+                    if not batch:
+                        break
+
+                    for doc in batch:
+                        emb = doc.get("embedding")
+                        if not emb:
+                            continue
+                        vec = np.array(emb, dtype=np.float32)
+                        norm = np.linalg.norm(vec)
+                        if norm > 0.0:
+                            vec /= norm
+                        raw_f.write(vec.tobytes())  # _EMBED_DIM × 4 bytes per vector
+                        texts.append(doc.get("text", ""))
+                        metas.append(doc.get("metadata", {}))
+                        count += 1
+
+                    last_id = batch[-1]["_id"]
+                    if count % 5000 == 0 or count == len(batch):
+                        logger.info("  Downloaded %d / %d chunks...", count, total)
+
+            logger.info("Download complete — %d chunks.", count)
+
+            if count == 0:
+                logger.warning("No embeddings found in MongoDB — cache not created.")
+                for tmp in (tmp_emb, tmp_raw, tmp_meta):
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                self._cache_loaded = True
+                return
+
+            # Materialise the full embedding matrix from the raw file.
+            # This is the only moment the entire matrix occupies RAM, and it is
+            # bounded: _ensure_cache() refuses to call this method for collections
+            # that exceed CACHE_SIZE_LIMIT.
+            mat = np.fromfile(tmp_raw, dtype=np.float32).reshape(count, _EMBED_DIM)
+            os.remove(tmp_raw)
+
+            np.save(tmp_emb, mat)
+            with open(tmp_meta, "w", encoding="utf-8") as f:
+                json.dump({"texts": texts, "metas": metas}, f)
+
+            # Atomic swap: replace the final files only after both temp files
+            # are fully written.  os.replace() is atomic on POSIX.
+            os.replace(tmp_emb, emb_path)
+            os.replace(tmp_meta, meta_path)
+
+            self._embeddings = mat
+            self._texts      = texts
+            self._metas      = metas
+            self._cache_loaded = True
+            logger.info("Cache built and saved — %d vectors (%s).", count, emb_path)
+
+        except Exception:
+            logger.exception(
+                "Cache build failed for '%s'; cleaning up temp files.",
+                self.collection_name,
+            )
+            for tmp in (tmp_emb, tmp_raw, tmp_meta):
+                if os.path.exists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+            raise
+        finally:
+            lock.release()
 
     def invalidate_cache(self):
         """Delete the local cache so it gets rebuilt on next search."""
         self._cache_loaded = False
-        self._embeddings = None
-        self._texts = []
-        self._metas = []
+        self._oversized    = None   # re-evaluate on next access
+        self._embeddings   = None
+        self._texts        = []
+        self._metas        = []
         for f in os.listdir(CACHE_DIR) if os.path.exists(CACHE_DIR) else []:
             if f.startswith(self.collection_name):
                 os.remove(os.path.join(CACHE_DIR, f))

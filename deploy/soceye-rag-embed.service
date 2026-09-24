@@ -1,0 +1,18 @@
+[Unit]
+Description=SOC-EYE vector corpus rebuild (one-off, resumable, long-running)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=soceye
+WorkingDirectory=/opt/soceye-rag
+EnvironmentFile=/opt/soceye-rag/.env
+ExecStart=/opt/soceye-rag/deploy/run_embeddings.sh
+# The rebuild is measured in hours. Never let systemd time it out.
+TimeoutStartSec=0
+TimeoutStopSec=300
+# The script handles its own retry/resume loop, so systemd must not restart it.
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
