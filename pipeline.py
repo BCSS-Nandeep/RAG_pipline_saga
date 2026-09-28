@@ -292,9 +292,6 @@ def run_query(question: str):
     """Ask the AI assistant a question."""
     bot = Assistant(
         llm_model=llm_client.LLM_MODEL,
-        mongo_uri="",
-        db_name="",
-        vector_collection="",
         top_k=TOP_K,
     )
 
@@ -373,11 +370,7 @@ def main():
         run_stats()
 
     if args.build_cache:
-        logger.info("Building vector search cache...")
-        store = VectorStore()
-        store.refresh_cache()
-        store.close()
-        logger.info("Cache ready.")
+        logger.info("Cache rebuilding is no longer necessary with PostgreSQL Native.")
 
     if args.ingest:
         run_ingestion(full=args.full)

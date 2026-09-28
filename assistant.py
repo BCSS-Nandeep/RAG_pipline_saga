@@ -90,7 +90,7 @@ SYSTEM_PROMPT = textwrap.dedent("""\
     • **Suggestion Reports** — classified suggestion posts with action tracking.
     • **Grievance Workflow Reports** — escalated grievance cases with workflow status.
 
-    You receive a DATABASE CONTEXT block with real MongoDB records.
+    You receive a DATABASE CONTEXT block with real database records.
     Each record is labelled with its type (ALERT, GRIEVANCE, CONTENT, DIAL-100 CALL,
     EVENT, PERSON OF INTEREST, KEYWORD, MONITORED PROFILE, DAILY PROGRAMME,
     TELEGRAM MSG, CRITICISM REPORT, SUGGESTION REPORT, etc.).
@@ -171,9 +171,6 @@ class Assistant:
     def __init__(
         self,
         llm_model: str,
-        mongo_uri: str,
-        db_name: str,
-        vector_collection: str,
         top_k: int = 10,
         source_collection: Optional[str] = None,
     ):
@@ -183,7 +180,7 @@ class Assistant:
 
         # Embedding backend comes from EMBED_* — self-hosted vLLM only.
         self.embedder = get_embedder()
-        self.store = VectorStore(uri=mongo_uri, db_name=db_name, collection_name=vector_collection)
+        self.store = VectorStore()
 
     # -- public API ----------------------------------------------------------
 
