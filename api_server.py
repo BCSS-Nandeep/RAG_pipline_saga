@@ -47,7 +47,7 @@ try:
     from osint_portal.app import app as osint_portal_app
 except ModuleNotFoundError:          # sub-app not vendored in this repo
     osint_portal_app = None
-from processor import MongoStreamProcessor, DocumentConverter
+from processor import PostgresStreamProcessor, DocumentConverter
 from chunker import TokenAwareChunker
 from vector_store import VectorStore
 
@@ -141,21 +141,15 @@ def _allow_ids_within_window(collection: str, days: int) -> Optional[set]:
         return None
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     try:
-        client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-        db = client[DB_NAME]
-        if collection not in db.list_collection_names():
-            client.close()
-            return set()
-        col = db[collection]
-        sample = col.find_one({}, sort=[("_id", DESCENDING)]) or {}
-        ts_field = next((f for f in TIMESTAMP_FIELDS if f in sample), None)
-        if not ts_field:
-            client.close()
-            return None  # cannot filter — fall back to no-window
-        cur = col.find({ts_field: {"$gte": cutoff}}, {"_id": 1}).limit(50000)
-        ids = {str(d["_id"]) for d in cur}
-        client.close()
-        return ids
+        from db import get_pool
+        with get_pool().connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM source_documents WHERE collection_name = %s AND created_at >= %s LIMIT 50000",
+                    (collection, cutoff)
+                )
+                ids = {str(row[0]) for row in cur.fetchall()}
+                return ids if ids else set()
     except Exception as e:
         logger.warning("time-window filter failed for '%s': %s", collection, e)
         return None
@@ -168,7 +162,16 @@ def _allow_ids_within_window(collection: str, days: int) -> Optional[set]:
 @app.get("/api/rag/health")
 def health():
     """Check MongoDB, the embedding host and the LLM endpoint."""
-    status = {"mongodb": False, "embedding": False, "llm": False}
+    status = {"postgresql": False, "mongodb": False, "embedding": False, "llm": False}
+    try:
+        from db import get_pool
+        with get_pool().connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+        status["postgresql"] = True
+    except Exception as e:
+        logger.error("PostgreSQL health check failed: %s", e)
+
     try:
         client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
         client.admin.command("ping")
@@ -213,14 +216,12 @@ def health():
 def list_collections():
     """Return all collection names in the configured database."""
     try:
-        client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-        db = client[DB_NAME]
-        names = db.list_collection_names()
-        client.close()
-        # Filter out system and vector collections
-        skip = {"system.profile", "system.js", VECTOR_COLLECTION}
-        collections = sorted([n for n in names if n not in skip])
-        return {"database": DB_NAME, "collections": collections}
+        from db import get_pool
+        with get_pool().connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT DISTINCT collection_name FROM source_documents")
+                collections = sorted([row[0] for row in cur.fetchall()])
+        return {"database": "postgresql", "collections": collections}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -236,7 +237,7 @@ def _get_store(vec_col: str) -> VectorStore:
     with _GLOBAL_STORES_LOCK:
         s = _GLOBAL_STORES.get(vec_col)
         if s is None:
-            s = VectorStore(uri=MONGODB_URI, db_name=DB_NAME, collection_name=vec_col)
+            s = VectorStore()
             _GLOBAL_STORES[vec_col] = s
         return s
 
@@ -250,10 +251,11 @@ def _list_vector_collections() -> list:
     allow-list is intentionally broad. Override via ALLOWED_QUERY_COLLECTIONS.
     """
     allowed = {f"{VECTOR_COLLECTION}_{c}" for c in ALLOWED_QUERY_COLLECTIONS}
-    client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-    db = client[DB_NAME]
-    existing = set(db.list_collection_names())
-    client.close()
+    from db import get_pool
+    with get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT metadata->>'source_collection' FROM vector_embeddings")
+            existing = {f"{VECTOR_COLLECTION}_{row[0]}" for row in cur.fetchall() if row[0]}
     return [c for c in allowed if c in existing]
 
 
@@ -1525,9 +1527,6 @@ def query(req: QueryRequest):
 
     bot = Assistant(
         llm_model=LLM_MODEL,
-        mongo_uri=MONGODB_URI,
-        db_name=DB_NAME,
-        vector_collection=vec_col,
         top_k=req.top_k,
         source_collection=collection if use_source_filter else None,
     )
@@ -1611,32 +1610,24 @@ def _auto_ingest_if_needed(collection: str) -> tuple:
     """
     per_col_vec = f"{VECTOR_COLLECTION}_{collection}"
 
-    client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-    db = client[DB_NAME]
-    existing = set(db.list_collection_names())
+    from db import get_pool
+    from source_store import SourceStore
+    
+    store = SourceStore()
+    source_doc_count = store.count_documents(collection)
 
     # Source collection must exist in the database
-    if collection not in existing:
-        client.close()
+    if source_doc_count == 0:
         return per_col_vec, False, False  # vec_col, use_source_filter, data_exists
 
-    # Already has a per-collection vector index with data — no ingestion needed
-    if per_col_vec in existing and db[per_col_vec].estimated_document_count() > 0:
-        client.close()
-        return per_col_vec, False, True
+    # Check if there's data in the vector store for this collection
+    with get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM vector_embeddings WHERE metadata->>'source_collection' = %s LIMIT 1", (collection,))
+            has_vectors = cur.fetchone() is not None
 
-    # Global vector collection has chunks for this collection
-    if VECTOR_COLLECTION in existing:
-        count = db[VECTOR_COLLECTION].count_documents(
-            {"metadata.source_collection": collection}, limit=1
-        )
-        if count > 0:
-            client.close()
-            return VECTOR_COLLECTION, True, True
-
-    # No embeddings — decide whether to ingest inline or in background
-    source_doc_count = db[collection].estimated_document_count()
-    client.close()
+    if has_vectors:
+        return per_col_vec, True, True
 
     if source_doc_count <= AUTO_INGEST_INLINE_LIMIT:
         # Small collection — ingest inline (fast, a few seconds)
@@ -1742,10 +1733,7 @@ def _process_job(job_id: str, question: str, collection: str, top_k: int,
             return
 
         bot = Assistant(
-                llm_model=LLM_MODEL,
-                mongo_uri=MONGODB_URI,
-            db_name=DB_NAME,
-            vector_collection=vec_col,
+            llm_model=LLM_MODEL,
             top_k=top_k,
             source_collection=collection if use_source_filter else None,
         )
@@ -1790,12 +1778,9 @@ def query_async(req: QueryRequest):
 
     # Verify the source collection actually exists in the database
     try:
-        client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-        db = client[DB_NAME]
-        existing = set(db.list_collection_names())
-        client.close()
-
-        if collection not in existing:
+        from source_store import SourceStore
+        store = SourceStore()
+        if store.count_documents(collection) == 0:
             raise HTTPException(
                 status_code=400,
                 detail=f"Collection '{collection}' does not exist in the database.",
@@ -1965,9 +1950,8 @@ def _run_ingest(collection: str) -> dict:
 
     known = _embedded_state(store)
 
-    client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-    src = client[DB_NAME][collection]
-    total_docs = src.estimated_document_count()
+    streamer = PostgresStreamProcessor(collection, batch_size=BATCH_SIZE)
+    total_docs = streamer.count_documents()
 
     docs_new = docs_changed = docs_skipped = docs_legacy = 0
     chunks_stored = embed_failures = 0
@@ -1980,8 +1964,8 @@ def _run_ingest(collection: str) -> dict:
             chunks_stored += store.upsert_chunks(pending)
             pending = []
 
-    for doc in src.find({}):
-        doc_id = str(doc.get("_id", ""))
+    for doc in streamer.stream_documents():
+        doc_id = str(doc.get("_id", doc.get("id", "")))
         try:
             text = converter.convert(doc)
             if not text.strip():
@@ -2054,7 +2038,6 @@ def _run_ingest(collection: str) -> dict:
                            doc_id, collection, str(exc)[:160])
 
     _flush()
-    client.close()
 
     docs_processed = docs_new + docs_changed
     if docs_processed:
@@ -2279,30 +2262,23 @@ def scheduler_runs(limit: int = 20):
 def stats():
     """Return ingestion stats across all vector collections."""
     try:
-        client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-        db = client[DB_NAME]
-        all_cols = db.list_collection_names()
-        vec_cols = [c for c in all_cols if c.startswith(VECTOR_COLLECTION)]
-
+        from db import get_pool
         result = {}
-        for vc in vec_cols:
-            col = db[vc]
-            count = col.estimated_document_count()
-            unique = 0
-            if count > 0:
-                # Aggregation avoids the 16MB cap that `distinct` hits on large collections.
-                try:
-                    agg = list(col.aggregate([
-                        {"$group": {"_id": "$metadata.document_id"}},
-                        {"$count": "n"},
-                    ], allowDiskUse=True))
-                    unique = agg[0]["n"] if agg else 0
-                except Exception as e:
-                    logger.warning("unique-doc count failed for %s: %s", vc, e)
-            result[vc] = {"chunks": count, "unique_documents": unique}
-
-        client.close()
-        return {"database": DB_NAME, "vector_collections": result}
+        with get_pool().connection() as conn:
+            with conn.cursor() as cur:
+                # Count total chunks and unique documents per collection
+                cur.execute("""
+                    SELECT metadata->>'source_collection', COUNT(*), COUNT(DISTINCT metadata->>'document_id')
+                    FROM vector_embeddings
+                    GROUP BY metadata->>'source_collection'
+                """)
+                for row in cur.fetchall():
+                    col_name = row[0] or "unknown"
+                    result[f"{VECTOR_COLLECTION}_{col_name}"] = {
+                        "chunk_count": row[1],
+                        "unique_documents": row[2]
+                    }
+        return {"database": "postgresql", "stats": result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
