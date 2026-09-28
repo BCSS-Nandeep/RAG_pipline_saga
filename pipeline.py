@@ -18,7 +18,7 @@ import textwrap
 from dotenv import load_dotenv
 from tqdm import tqdm
 
-from processor import MongoStreamProcessor, DocumentConverter
+from processor import PostgresStreamProcessor, DocumentConverter
 from chunker import TokenAwareChunker
 from embedder import get_embedder
 from vector_store import VectorStore
@@ -31,10 +31,7 @@ import llm_client
 
 load_dotenv()
 
-MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
-DB_NAME = os.getenv("DB_NAME", "your_db")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "your_collection")
-VECTOR_COLLECTION = os.getenv("VECTOR_COLLECTION", "vector_embeddings")
 
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "500"))
 EMBED_BATCH = int(os.getenv("EMBED_BATCH_SIZE", "50"))
@@ -64,20 +61,17 @@ def run_health_check() -> bool:
     """Verify MongoDB and both self-hosted vLLM services are reachable."""
     ok = True
 
-    # MongoDB
-    logger.info("Checking MongoDB at %s ...", MONGODB_URI)
+    # PostgreSQL
+    logger.info("Checking PostgreSQL database ...")
     try:
-        from pymongo import MongoClient
-        client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-        client.admin.command("ping")
-        db = client[DB_NAME]
-        cols = db.list_collection_names()
-        logger.info("  MongoDB OK — database '%s' has %d collections.", DB_NAME, len(cols))
-        if COLLECTION_NAME not in cols:
-            logger.warning("  Source collection '%s' not found in database.", COLLECTION_NAME)
-        client.close()
+        from db import get_pool
+        pool = get_pool()
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+        logger.info("  PostgreSQL OK")
     except Exception as exc:
-        logger.error("  MongoDB FAILED: %s", exc)
+        logger.error("  PostgreSQL FAILED: %s", exc)
         ok = False
 
     # Embedding service — verify the vector width, not just reachability
@@ -157,11 +151,11 @@ def run_ingestion(full: bool = False):
     logger.info("=" * 60)
 
     # --- Initialise components ---
-    streamer = MongoStreamProcessor(MONGODB_URI, DB_NAME, COLLECTION_NAME, BATCH_SIZE)
+    streamer = PostgresStreamProcessor(COLLECTION_NAME, BATCH_SIZE)
     converter = DocumentConverter()
     chunker = TokenAwareChunker(min_tokens=CHUNK_MIN, max_tokens=CHUNK_MAX, overlap=CHUNK_OVERLAP)
     embedder = get_embedder()
-    store = VectorStore(MONGODB_URI, DB_NAME, VECTOR_COLLECTION)
+    store = VectorStore()
 
     # Pre-flight
     if not embedder.check_health():
@@ -283,15 +277,11 @@ def run_ingestion(full: bool = False):
     logger.info("  Documents processed : %d", docs_processed)
     logger.info("  Chunks stored       : %d", chunks_stored)
     logger.info("  Embed failures      : %d", embed_failures)
-    logger.info("  Total in vector DB  : %d", VectorStore(MONGODB_URI, DB_NAME, VECTOR_COLLECTION).total_chunks())
+    logger.info("  Total in vector DB  : %d", VectorStore().total_chunks())
     logger.info("=" * 60)
 
-    # Rebuild search cache after ingestion
-    logger.info("Rebuilding vector search cache...")
-    cache_store = VectorStore(MONGODB_URI, DB_NAME, VECTOR_COLLECTION)
-    cache_store.refresh_cache()
-    cache_store.close()
-    logger.info("Search cache ready — queries will be fast now.")
+    # Cache rebuilding is no longer necessary with PostgreSQL
+    logger.info("Native PostgreSQL vectors are ready.")
 
 
 # ---------------------------------------------------------------------------
@@ -302,9 +292,9 @@ def run_query(question: str):
     """Ask the AI assistant a question."""
     bot = Assistant(
         llm_model=llm_client.LLM_MODEL,
-        mongo_uri=MONGODB_URI,
-        db_name=DB_NAME,
-        vector_collection=VECTOR_COLLECTION,
+        mongo_uri="",
+        db_name="",
+        vector_collection="",
         top_k=TOP_K,
     )
 
@@ -332,18 +322,18 @@ def run_query(question: str):
 
 def run_stats():
     """Print quick stats about source and vector collections."""
-    from pymongo import MongoClient
-    client = MongoClient(MONGODB_URI)
-    db = client[DB_NAME]
+    from source_store import SourceStore
+    from vector_store import VectorStore
 
-    src_count = db[COLLECTION_NAME].estimated_document_count()
-    vec_count = db[VECTOR_COLLECTION].estimated_document_count() if VECTOR_COLLECTION in db.list_collection_names() else 0
-    unique_docs = len(db[VECTOR_COLLECTION].distinct("metadata.document_id")) if vec_count else 0
+    src_store = SourceStore()
+    src_count = src_store.count_documents(COLLECTION_NAME)
 
-    client.close()
+    vec_store = VectorStore()
+    vec_count = vec_store.total_chunks()
+    vec_store.close()
 
     print(f"\nSource collection '{COLLECTION_NAME}': ~{src_count} documents")
-    print(f"Vector collection '{VECTOR_COLLECTION}': {vec_count} chunks from {unique_docs} unique documents\n")
+    print(f"Vector collection 'vector_embeddings': {vec_count} chunks\n")
 
 
 # ---------------------------------------------------------------------------
@@ -384,7 +374,7 @@ def main():
 
     if args.build_cache:
         logger.info("Building vector search cache...")
-        store = VectorStore(MONGODB_URI, DB_NAME, VECTOR_COLLECTION)
+        store = VectorStore()
         store.refresh_cache()
         store.close()
         logger.info("Cache ready.")

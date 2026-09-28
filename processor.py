@@ -10,8 +10,6 @@ from datetime import datetime
 from typing import Generator, Dict, Any, Optional, List
 
 from bson import ObjectId
-from pymongo import MongoClient, ASCENDING
-from pymongo.collection import Collection
 
 logger = logging.getLogger(__name__)
 
@@ -20,44 +18,26 @@ logger = logging.getLogger(__name__)
 # Stage 1 — Streaming Processor
 # ---------------------------------------------------------------------------
 
-class MongoStreamProcessor:
-    """Cursor-based MongoDB reader with batch pagination."""
+class PostgresStreamProcessor:
+    """Cursor-based PostgreSQL reader with batch pagination."""
 
     def __init__(
         self,
-        uri: str,
-        db_name: str,
         collection_name: str,
         batch_size: int = 500,
     ):
-        self.uri = uri
-        self.db_name = db_name
         self.collection_name = collection_name
         self.batch_size = batch_size
-        self._client: Optional[MongoClient] = None
-
-    # -- connection helpers --------------------------------------------------
-
-    def _connect(self) -> Collection:
-        self._client = MongoClient(self.uri)
-        db = self._client[self.db_name]
-        return db[self.collection_name]
-
-    def close(self):
-        if self._client:
-            self._client.close()
-            self._client = None
+        
+        # Lazy import to avoid circular dependencies
+        from source_store import SourceStore
+        self._store = SourceStore()
 
     # -- public API ----------------------------------------------------------
 
     def count_documents(self, query: Optional[dict] = None) -> int:
-        collection = self._connect()
-        if query:
-            count = collection.count_documents(query)
-        else:
-            count = collection.estimated_document_count()
-        self.close()
-        return count
+        """Count documents in the PostgreSQL collection."""
+        return self._store.count_documents(self.collection_name)
 
     def fetch_batch(
         self,
@@ -65,34 +45,23 @@ class MongoStreamProcessor:
         after_id: Optional[str] = None,
         since: Optional[datetime] = None,
     ) -> List[Dict[str, Any]]:
-        """Fetch a single batch of documents using _id cursor pagination.
+        """Fetch a single batch of documents using ID cursor pagination.
 
         Args:
             batch_number: for logging only.
-            after_id: ObjectId string — fetch docs with _id > this value.
+            after_id: string ID — fetch docs with id > this value.
             since: only fetch docs with created_at > this timestamp.
 
         Returns:
             List of documents (up to self.batch_size).
         """
-        collection = self._connect()
-
-        query: dict = {}
-        if after_id:
-            try:
-                query["_id"] = {"$gt": ObjectId(after_id)}
-            except Exception:
-                pass
-        if since:
-            query["created_at"] = {"$gt": since}
-
-        docs = list(
-            collection.find(query)
-            .sort("_id", ASCENDING)
-            .limit(self.batch_size)
+        docs = self._store.fetch_batch(
+            collection_name=self.collection_name,
+            limit=self.batch_size,
+            after_id=after_id,
+            since=since
         )
-
-        self.close()
+        
         logger.debug("Batch %d: fetched %d docs (after_id=%s)", batch_number, len(docs), after_id)
         return docs
 
@@ -103,38 +72,30 @@ class MongoStreamProcessor:
     ) -> Generator[Dict[str, Any], None, None]:
         """Legacy streaming interface — yields all documents one by one."""
         skip_ids = skip_ids or set()
-        collection = self._connect()
-
-        query = {}
-        if since:
-            query["created_at"] = {"$gt": since}
-        elif skip_ids:
-            oid_list = []
-            for sid in skip_ids:
-                try:
-                    oid_list.append(ObjectId(sid))
-                except Exception:
-                    pass
-            if oid_list:
-                query = {"_id": {"$nin": oid_list}}
-
-        cursor = collection.find(
-            query,
-            no_cursor_timeout=True,
-            batch_size=self.batch_size,
-        )
-
+        
+        after_id = None
         processed = 0
-        try:
-            for doc in cursor:
+        batch_number = 1
+        
+        while True:
+            docs = self.fetch_batch(batch_number, after_id=after_id, since=since)
+            if not docs:
+                break
+                
+            for doc in docs:
+                doc_id = str(doc.get("_id", ""))
+                if skip_ids and doc_id in skip_ids:
+                    continue
+                    
                 processed += 1
                 if processed % 1000 == 0:
                     logger.info("Progress: %d documents streamed", processed)
                 yield doc
-        finally:
-            cursor.close()
-            self.close()
-            logger.info("Stream finished — %d yielded", processed)
+                
+            after_id = str(docs[-1].get("_id", ""))
+            batch_number += 1
+
+        logger.info("Stream finished — %d yielded", processed)
 
 
 # ---------------------------------------------------------------------------
