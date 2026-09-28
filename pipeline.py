@@ -21,7 +21,7 @@ from tqdm import tqdm
 from processor import MongoStreamProcessor, DocumentConverter
 from chunker import TokenAwareChunker
 from embedder import get_embedder
-from vector_store import VectorStore
+from store_factory import get_vector_store as VectorStore
 from assistant import Assistant
 import llm_client
 

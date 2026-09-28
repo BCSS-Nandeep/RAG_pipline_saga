@@ -17,7 +17,7 @@ import requests
 
 from embedder import get_embedder
 from llm_client import generate as llm_generate
-from vector_store import VectorStore
+from store_factory import get_vector_store as VectorStore
 
 logger = logging.getLogger(__name__)
 

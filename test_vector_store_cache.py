@@ -7,7 +7,8 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 
 # Adjust import based on the actual module structure
-from vector_store import VectorStore, CACHE_DIR, CACHE_SIZE_LIMIT, _EMBED_DIM
+from store_factory import get_vector_store as VectorStore
+from vector_store import CACHE_DIR, CACHE_SIZE_LIMIT, _EMBED_DIM
 
 class TestVectorStoreCache(unittest.TestCase):
     def setUp(self):

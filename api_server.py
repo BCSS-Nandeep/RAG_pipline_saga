@@ -49,7 +49,7 @@ except ModuleNotFoundError:          # sub-app not vendored in this repo
     osint_portal_app = None
 from processor import MongoStreamProcessor, DocumentConverter
 from chunker import TokenAwareChunker
-from vector_store import VectorStore
+from store_factory import get_vector_store as VectorStore
 
 load_dotenv()
 

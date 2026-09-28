@@ -41,7 +41,7 @@ logging.basicConfig(level=logging.ERROR)
 from embedder import (EXPECTED_DIM, EmbeddingConfigError,   # noqa: E402
                       describe_hardware, detect_hardware, get_embedder)
 import llm_client                                           # noqa: E402
-from vector_store import VectorStore                        # noqa: E402
+from store_factory import get_vector_store as VectorStore                        # noqa: E402
 
 MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://127.0.0.1:27017")
 DB_NAME = os.getenv("DB_NAME", "test")
