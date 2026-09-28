@@ -70,16 +70,16 @@ class SourceStore:
         return None
 
     def count_documents(self, collection_name: Optional[str] = None) -> int:
-        """Count documents, optionally filtered by collection."""
+        """Count documents, natively querying the table named collection_name."""
+        if not collection_name or not collection_name.isidentifier():
+            return 0
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
-                if collection_name:
-                    cur.execute(
-                        "SELECT count(*) FROM source_documents WHERE collection_name = %s",
-                        (collection_name,)
-                    )
-                else:
-                    cur.execute("SELECT count(*) FROM source_documents")
+                # Check if table exists first to avoid crashing
+                cur.execute("SELECT to_regclass(%s)", (collection_name,))
+                if not cur.fetchone()[0]:
+                    return 0
+                cur.execute(f"SELECT count(*) FROM {collection_name}")
                 return cur.fetchone()[0]
 
     def fetch_batch(
@@ -89,14 +89,15 @@ class SourceStore:
         after_id: Optional[str] = None,
         since: Optional[datetime] = None,
     ) -> List[Dict[str, Any]]:
-        """Fetch documents for incremental ingestion with ordering by ID.
-        
-        This perfectly mirrors PostgreSQLStreamProcessor's sorting and pagination capabilities.
-        """
-        sql = "SELECT document_data FROM source_documents WHERE collection_name = %s"
-        params = [collection_name]
+        """Fetch documents natively from the table, ordering by id."""
+        if not collection_name.isidentifier():
+            return []
+            
+        sql = f"SELECT * FROM {collection_name} WHERE 1=1"
+        params = []
         
         if since:
+            # We assume a standard 'created_at' column exists for 'since' filtering
             sql += " AND created_at > %s"
             params.append(since)
             
@@ -108,12 +109,18 @@ class SourceStore:
         params.append(limit)
 
         results = []
+        import psycopg.rows
         with self._pool.connection() as conn:
-            with conn.cursor() as cur:
+            with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+                cur.execute(f"SELECT to_regclass(%s)", (collection_name,))
+                if not cur.fetchone()['to_regclass']:
+                    return []
                 cur.execute(sql, params)
                 for row in cur.fetchall():
-                    doc = row[0] if isinstance(row[0], dict) else json.loads(row[0])
-                    results.append(doc)
+                    # Map the native 'id' to '_id' for the pipeline to use
+                    if 'id' in row:
+                        row['_id'] = str(row['id'])
+                    results.append(row)
         return results
         
     def delete_test_documents(self, prefix: str = "pg_test_"):

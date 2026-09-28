@@ -219,24 +219,24 @@ def _list_vector_collections() -> list:
 
 
 _COUNT_KEYWORDS = {
-    "alerts":                      ["alert", "alerts"],
-    "grievances":                  ["grievance", "grievances", "greivance", "greivances",
+    "social_media_alerts":                      ["alert", "social_media_alerts"],
+    "social_media_grievances":                  ["grievance", "social_media_grievances", "greivance", "greivances",
                                     "complaint", "complaints"],
-    "events":                      ["event", "events", "festival", "festivals", "rally", "rallies",
+    "social_media_events":                      ["event", "social_media_events", "festival", "festivals", "rally", "rallies",
                                     "protest", "protests", "procession", "processions"],
     "dial100incidents":            ["dial 100", "dial-100", "dial100", "100 call", "100 calls",
                                     "emergency call", "emergency calls", "incident", "incidents"],
-    "pois":                        ["poi", "pois", "person of interest", "persons of interest",
+    "social_media_profiles":                        ["poi", "social_media_profiles", "person of interest", "persons of interest",
                                     "suspect", "suspects", "history sheeter", "history-sheeter",
                                     "history sheeters", "accused"],
     "keywords":                    ["keyword", "keywords", "watch word", "watch words",
                                     "watchword", "watchwords", "monitored word", "monitored words",
                                     "top keyword", "top keywords"],
-    "sources":                     ["source", "sources", "monitored profile", "monitored profiles",
+    "social_media_accounts":                     ["source", "social_media_accounts", "monitored profile", "monitored profiles",
                                     "monitored account", "monitored accounts",
                                     "tracked account", "tracked accounts", "tracked profile",
                                     "tracked profiles"],
-    "contents":                    ["content", "contents", "post", "posts", "tweet", "tweets",
+    "social_media_posts":                    ["content", "social_media_posts", "post", "posts", "tweet", "tweets",
                                     "reel", "reels", "story", "stories", "video", "videos"],
     "dailyprogrammes":             ["programme", "programmes", "program", "programs",
                                     "daily programme", "daily programmes", "schedule", "schedules"],
@@ -245,7 +245,7 @@ _COUNT_KEYWORDS = {
     "criticism_reports":           ["criticism", "critique", "critisism", "critisisum",
                                     "criticsm", "critisim", "criticisim", "criticisms",
                                     "criticism report", "criticism reports"],
-    "grievance_workflow_reports":  ["workflow report", "grievance workflow"],
+    "social_media_grievance_reports":  ["workflow report", "grievance workflow"],
     "query_reports":               ["query report", "query reports"],
     "suggestion_reports":          ["suggestion report", "suggestion reports"],
 }
@@ -278,7 +278,7 @@ _COUNT_TIME_PATTERNS = [
 # risk_level, so that is what an officer reading the portal means by "high
 # alert". "High priority" is matched separately and the two are never merged.
 _COUNT_FILTERS: dict = {
-    "alerts": [
+    "social_media_alerts": [
         (r"\bhigh\s+priorit(y|ies)\b|\bpriority\s*[:=]?\s*high\b",
          {"priority": "HIGH"}, "priority=HIGH"),
         (r"\bmedium\s+priorit(y|ies)\b|\bpriority\s*[:=]?\s*medium\b",
@@ -433,11 +433,11 @@ def _chat_only_answer(question: str) -> dict:
     """Pure LLM call — no DB, no vector search. For casual / general questions."""
     verdict = intent_router.classify(question)
     if verdict.intent is intent_router.Intent.GREETING:
-        return {"answer": intent_router.greeting_answer(question), "sources": [],
+        return {"answer": intent_router.greeting_answer(question), "social_media_accounts": [],
                 "question": question, "smalltalk": True, "scope": "chat_only",
                 "intent": verdict.intent.value, "rag_used": False}
     if verdict.intent is intent_router.Intent.CAPABILITY:
-        return {"answer": intent_router.CAPABILITY_ANSWER, "sources": [],
+        return {"answer": intent_router.CAPABILITY_ANSWER, "social_media_accounts": [],
                 "question": question, "scope": "chat_only",
                 "intent": verdict.intent.value, "rag_used": False}
     prompt = (
@@ -446,7 +446,7 @@ def _chat_only_answer(question: str) -> dict:
         f"Assistant:"
     )
     answer = _llm_answer(prompt)
-    return {"answer": answer, "sources": [], "question": question,
+    return {"answer": answer, "social_media_accounts": [], "question": question,
             "scope": "chat_only", "use_db": False}
 
 
@@ -871,23 +871,23 @@ _COLLECTION_ROUTING = [
     (re.compile(r"\bdial[\s-]?100\b|\bemergency\s*calls?\b|\b100\s*calls?\b|\bincidents?\b", re.I),
      ["dial100incidents"]),
     (re.compile(r"\bevents?\b|\bfestivals?\b|\brall(y|ies)\b|\bprotests?\b|\bprocessions?\b|\bgatherings?\b|\bhartaals?\b|\bbandhs?\b", re.I),
-     ["events"]),
+     ["social_media_events"]),
     (re.compile(r"\bpois?\b|\bpersons?\s*of\s*interest\b|\bsuspects?\b|\baccused\b|\bhistory[\s-]?sheeters?\b|\bcriminals?\b", re.I),
-     ["pois"]),
+     ["social_media_profiles"]),
     # "profile/profiles" is ambiguous in the portal — it can mean a Person of
     # Interest record OR a monitored social-media account (sources). Pull both.
     (re.compile(r"\bprofiles?\b", re.I),
-     ["pois", "sources"]),
+     ["social_media_profiles", "social_media_accounts"]),
     (re.compile(r"\bkeywords?\b|\bmonitored\s*words?\b|\bwatch[\s-]?words?\b|\btracking\s*terms?\b|\btop\s*keywords?\b", re.I),
      ["keywords"]),
     (re.compile(r"\bsources?\b|\bmonitored\s*(accounts?|profiles?)\b|\btracked\s*(accounts?|profiles?)\b", re.I),
-     ["sources"]),
+     ["social_media_accounts"]),
     (re.compile(r"\bprogrammes?\b|\bprograms?\b|\bschedules?\b|\bdaily\s*programmes?\b|\bannouncements?\b", re.I),
      ["dailyprogrammes"]),
     (re.compile(r"\btelegram\b|\btg\s*messages?\b|\btg\s*groups?\b|\bchannel\s*messages?\b", re.I),
      ["telegrammessages"]),
     (re.compile(r"\bcontents?\b|\bposts?\b|\btweets?\b|\breels?\b|\bstor(y|ies)\b|\bvideos?\b|\bsocial\s*media\b", re.I),
-     ["contents"]),
+     ["social_media_posts"]),
     (re.compile(r"\bcriticisms?\b|\bcritiques?\b|\bcritisisms?\b", re.I),
      ["criticismreports"]),
     (re.compile(r"\bsuggestions?\b", re.I),
@@ -900,12 +900,12 @@ _COLLECTION_ROUTING = [
 
 # Registry: collection_name → (fields, formatter, ts_field, default_limit)
 _EXTRA_COLLECTION_REGISTRY = {
-    "contents":              (CONTENT_FIELDS,            _fmt_content,            "published_at", 8),
+    "social_media_posts":              (CONTENT_FIELDS,            _fmt_content,            "published_at", 8),
     "dial100incidents":      (DIAL100_FIELDS,            _fmt_dial100,            "date",         8),
-    "events":                (EVENT_FIELDS,              _fmt_event,              "start_date",   6),
-    "pois":                  (POI_FIELDS,                _fmt_poi,                None,           6),
+    "social_media_events":                (EVENT_FIELDS,              _fmt_event,              "start_date",   6),
+    "social_media_profiles":                  (POI_FIELDS,                _fmt_poi,                None,           6),
     "keywords":              (KEYWORD_FIELDS,            _fmt_keyword,            None,          10),
-    "sources":               (SOURCE_FIELDS,             _fmt_source,             None,           8),
+    "social_media_accounts":               (SOURCE_FIELDS,             _fmt_source,             None,           8),
     "dailyprogrammes":       (DAILY_PROGRAMME_FIELDS,    _fmt_daily_programme,    "date",         6),
     "telegrammessages":      (TELEGRAM_FIELDS,           _fmt_telegram,           "date",         8),
     "criticismreports":      (CRITICISM_REPORT_FIELDS,   _fmt_criticism_report,   "post_date",    6),
@@ -922,14 +922,14 @@ _BROAD_QUESTION_RE = re.compile(
 # Modules pulled by default for any question that doesn't specifically target
 # one — covers the operational data officers care about most.
 _DEFAULT_EXTRA_COLLECTIONS = [
-    "contents", "dial100incidents", "events", "dailyprogrammes",
-    "pois", "keywords", "sources",
+    "social_media_posts", "dial100incidents", "social_media_events", "dailyprogrammes",
+    "social_media_profiles", "keywords", "social_media_accounts",
 ]
 
 # Every supported extra collection — used when the question is broad
 # ("all modules", "overall summary", "everything", etc.).
 _ALL_EXTRA_COLLECTIONS = [
-    "contents", "dial100incidents", "events", "pois", "keywords", "sources",
+    "social_media_posts", "dial100incidents", "social_media_events", "social_media_profiles", "keywords", "social_media_accounts",
     "dailyprogrammes", "telegrammessages",
     "criticismreports", "suggestionreports",
 ]
@@ -1024,17 +1024,17 @@ def _global_query(question: str, top_k: int, time_window_days: Optional[int]) ->
     # ── routes that need no retrieval ────────────────────────────────────────
     if verdict.intent is intent_router.Intent.GREETING:
         return _finish({"answer": intent_router.greeting_answer(question),
-                        "sources": [], "question": question,
+                        "social_media_accounts": [], "question": question,
                         "scope": "greeting", "smalltalk": True})
 
     if verdict.intent is intent_router.Intent.CAPABILITY:
-        return _finish({"answer": intent_router.CAPABILITY_ANSWER, "sources": [],
+        return _finish({"answer": intent_router.CAPABILITY_ANSWER, "social_media_accounts": [],
                         "question": question, "scope": "capability"})
 
     if verdict.intent is intent_router.Intent.UNSUPPORTED:
         return _finish({"answer": intent_router.limitation_notice(
                             verdict.unsupported, data_follows=False),
-                        "sources": [], "question": question,
+                        "social_media_accounts": [], "question": question,
                         "scope": "unsupported"})
 
     if verdict.intent is intent_router.Intent.GENERAL:
@@ -1044,7 +1044,7 @@ def _global_query(question: str, top_k: int, time_window_days: Optional[int]) ->
             temperature=0.3, max_tokens=800, meta=meta)
         log["llm_status"] = meta.get("status")
         log["prompt_tokens"] = meta.get("prompt_tokens") or 0
-        return _finish({"answer": answer, "sources": [], "question": question,
+        return _finish({"answer": answer, "social_media_accounts": [], "question": question,
                         "scope": "general"})
 
     # ── counts answer exactly, without an LLM ────────────────────────────────
@@ -1165,7 +1165,7 @@ def _global_query(question: str, top_k: int, time_window_days: Optional[int]) ->
         })
 
     return _finish({
-        "answer": answer, "sources": sources, "question": question,
+        "answer": answer, "social_media_accounts": sources, "question": question,
         "scope": "vec", "window_doc_count": log["vector_candidates"],
         "time_window_days": days,
         "candidates_considered": selection.considered,
@@ -1205,7 +1205,7 @@ def query(req: QueryRequest):
         if not data_exists:
             return {
                 "answer": f"The collection '{collection}' does not exist in the database.",
-                "sources": [],
+                "social_media_accounts": [],
                 "question": req.question,
                 "collection": collection,
                 "vector_collection": vec_col,
@@ -1225,7 +1225,7 @@ def query(req: QueryRequest):
     bot.close()
     # Backstop: enforce the 10-line / always-include-links contract even when
     # the per-collection path is used.
-    snippet_previews = [s.get("preview", "") for s in result.get("sources", []) if s.get("preview")]
+    snippet_previews = [s.get("preview", "") for s in result.get("social_media_accounts", []) if s.get("preview")]
     if snippet_previews:
         result["answer"] = _ensure_minimum_answer(
             result.get("answer", ""), snippet_previews, req.question
@@ -1296,7 +1296,7 @@ def _run_query_job(job_id: str, collection: str, question: str, top_k: int, use_
             answer = "No indexed data found. Indexing may be in progress or failed."
             finished = datetime.now(timezone.utc)
             _save_job(job_id, {
-                "job_id": job_id, "status": "completed", "answer": answer, "sources": [],
+                "job_id": job_id, "status": "completed", "answer": answer, "social_media_accounts": [],
                 "finished_at": finished, "duration_ms": int((finished - started).total_seconds() * 1000)
             })
             return
@@ -1309,7 +1309,7 @@ def _run_query_job(job_id: str, collection: str, question: str, top_k: int, use_
         finished = datetime.now(timezone.utc)
         _save_job(job_id, {
             "job_id": job_id, "status": "completed",
-            "answer": result.get("answer", ""), "sources": result.get("sources", []),
+            "answer": result.get("answer", ""), "social_media_accounts": result.get("social_media_accounts", []),
             "finished_at": finished, "duration_ms": int((finished - started).total_seconds() * 1000)
         })
         logger.info("Job %s completed in %ss", job_id, (finished - started).total_seconds())
@@ -1326,7 +1326,7 @@ def query_async(req: QueryRequest):
     If no embeddings exist for the requested collection, the background worker
     will auto-ingest before answering — no manual ingestion required.
     """
-    collection = req.collection or os.getenv("COLLECTION_NAME", "contents")
+    collection = req.collection or os.getenv("COLLECTION_NAME", "social_media_posts")
 
     # Verify the source collection actually exists in the database
     try:
@@ -1359,7 +1359,7 @@ def query_async(req: QueryRequest):
         "top_k": req.top_k,
         "created_at": now,
         "answer": None,
-        "sources": [],
+        "social_media_accounts": [],
     })
 
     t = threading.Thread(
@@ -1448,7 +1448,7 @@ def _ingest_runs_col(): return
 def _dummy_func(raw_docs, top_n, hours, requested_subset):
 
     if not raw_docs:
-        return {"alerts": [], "categories": {}, "total_scanned": 0,
+        return {"social_media_alerts": [], "categories": {}, "total_scanned": 0,
                 "total_unique": 0, "top_n_per_category": top_n, "hours": hours,
                 "message": f"No alerts found in the last {hours} hour(s)."}
 
@@ -1569,7 +1569,7 @@ def _dummy_func(raw_docs, top_n, hours, requested_subset):
     pass
 
     return {
-        "alerts": result_docs,
+        "social_media_alerts": result_docs,
         "categories": category_summary,
         "total_scanned": len(raw_docs),
         "total_unique": total_unique,
