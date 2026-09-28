@@ -33,6 +33,16 @@ import os
 import threading
 from typing import List, Optional, Sequence
 
+from dotenv import load_dotenv
+
+# Every EMBED_* constant below is read at import time. api_server.py imports
+# this module before it calls load_dotenv(), so without this call the .env
+# overrides are silently dropped and the serving process embeds with the code
+# defaults (notably EMBED_MAX_LENGTH=512) while regenerate_embeddings.py --
+# which does load .env first -- embeds at 1024. That mismatch writes vectors
+# into the corpus that no query can reproduce, so load the file here too.
+load_dotenv()
+
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- #
