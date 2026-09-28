@@ -133,26 +133,10 @@ TIMESTAMP_FIELDS = (
 )
 
 
-def _allow_ids_within_window(collection: str, days: int) -> Optional[set]:
-    """Return a set of stringified _id values whose timestamp is within the
-    last *days* days. Returns None if no timestamp field can be detected
-    (caller should treat None as "no filter")."""
+def _get_cutoff_date(days: int) -> Optional[datetime]:
     if not days or days <= 0:
         return None
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    try:
-        from db import get_pool
-        with get_pool().connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT id FROM source_documents WHERE collection_name = %s AND created_at >= %s LIMIT 50000",
-                    (collection, cutoff)
-                )
-                ids = {str(row[0]) for row in cur.fetchall()}
-                return ids if ids else set()
-    except Exception as e:
-        logger.warning("time-window filter failed for '%s': %s", collection, e)
-        return None
+    return datetime.now(timezone.utc) - timedelta(days=days)
 
 
 # ---------------------------------------------------------------------------
@@ -1531,8 +1515,8 @@ def query(req: QueryRequest):
         source_collection=collection if use_source_filter else None,
     )
 
-    allow_ids = _allow_ids_within_window(collection, req.time_window_days or 0)
-    result = bot.ask(req.question, doc_id_filter=allow_ids)
+    cutoff_date = _get_cutoff_date(req.time_window_days or 0)
+    result = bot.ask(req.question, cutoff_date=cutoff_date)
     bot.close()
     # Backstop: enforce the 10-line / always-include-links contract even when
     # the per-collection path is used.
@@ -1545,8 +1529,8 @@ def query(req: QueryRequest):
     result["vector_collection"] = vec_col
     result["scoped_via_metadata"] = use_source_filter
     result["time_window_days"] = req.time_window_days
-    if allow_ids is not None:
-        result["window_doc_count"] = len(allow_ids)
+    if cutoff_date is not None:
+        result["window_applied"] = True
     return result
 
 
@@ -1737,8 +1721,8 @@ def _process_job(job_id: str, question: str, collection: str, top_k: int,
             top_k=top_k,
             source_collection=collection if use_source_filter else None,
         )
-        allow_ids = _allow_ids_within_window(collection, time_window_days or 0)
-        result = bot.ask(question, doc_id_filter=allow_ids)
+        cutoff_date = _get_cutoff_date(time_window_days or 0)
+        result = bot.ask(question, cutoff_date=cutoff_date)
         bot.close()
 
         finished = datetime.now(timezone.utc)
@@ -1942,7 +1926,7 @@ def _run_ingest(collection: str) -> dict:
     chunker = TokenAwareChunker(min_tokens=CHUNK_MIN, max_tokens=CHUNK_MAX,
                                 overlap=CHUNK_OVERLAP)
     embedder = get_embedder()
-    store = VectorStore(MONGODB_URI, DB_NAME, vec_col)
+    store = VectorStore()
 
     if not embedder.check_health():
         store.close()
@@ -3876,10 +3860,9 @@ def top_alerts_cached(date: Optional[str] = None, hours: int = 24, mode: Optiona
 def refresh_cache():
     """Rebuild the local vector search cache from MongoDB."""
     try:
-        store = VectorStore(MONGODB_URI, DB_NAME, VECTOR_COLLECTION)
+        store = VectorStore()
         store.refresh_cache()
-        count = len(store._texts)
         store.close()
-        return {"message": f"Cache rebuilt with {count} vectors."}
+        return {"message": "Cache refreshed. (PostgreSQL queries dynamically)"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

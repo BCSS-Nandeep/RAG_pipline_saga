@@ -14,6 +14,7 @@ import logging
 import os
 import sys
 import textwrap
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from tqdm import tqdm
@@ -144,7 +145,6 @@ def run_ingestion(full: bool = False):
 
     On restart, resumes from the last completed batch.
     """
-    from datetime import datetime, timezone
 
     logger.info("=" * 60)
     logger.info("INGESTION PIPELINE START (batch mode)")

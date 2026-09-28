@@ -17,9 +17,8 @@ logger = logging.getLogger(__name__)
 class VectorStore:
     """Read/write 768-dim vectors in a PostgreSQL table and search by cosine similarity."""
 
-    def __init__(self, uri: str = None, db_name: str = None, collection_name: str = None):
-        # The arguments are kept for backward compatibility with existing RAG callers
-        # but are ignored because PostgreSQL connection is managed via db.py
+    def __init__(self):
+        # PostgreSQL connection is managed via db.py
         self._pool = get_pool()
 
     # -- connection ----------------------------------------------------------
@@ -44,7 +43,7 @@ class VectorStore:
         """
         if not chunks:
             return 0
-            
+
         written = 0
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
@@ -73,27 +72,27 @@ class VectorStore:
                     emb = chunk["embedding"]
                     if len(emb) != 768:
                         raise ValueError(f"Embedding must be 768 dimensions, got {len(emb)}")
-                        
+
                     norm = math.sqrt(sum(x * x for x in emb))
                     doc_id = meta["document_id"]
                     chunk_idx = meta["chunk_index"]
                     text = chunk["text"]
-                    
+
                     now = datetime.now(timezone.utc)
                     created_at = meta.get("created_at", now)
-                    
+
                     # Ensure source_created_at is ISO string format for JSONB compatibility
                     if "source_created_at" in meta and isinstance(meta["source_created_at"], datetime):
                         meta["source_created_at"] = meta["source_created_at"].isoformat()
-                    
+
                     meta_json = json.dumps(meta, default=str)
-                    
+
                     params.append((doc_id, chunk_idx, text, emb, norm, meta_json, created_at))
-                
+
                 cur.executemany(sql, params)
                 written = cur.rowcount if cur.rowcount >= 0 else len(chunks)
             conn.commit()
-            
+
         logger.debug("Upserted %d chunks into PostgreSQL.", len(chunks))
         return len(chunks)
 
@@ -119,10 +118,10 @@ class VectorStore:
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT metadata->>'source_created_at' 
-                    FROM vector_embeddings 
+                    SELECT metadata->>'source_created_at'
+                    FROM vector_embeddings
                     WHERE metadata->>'source_created_at' IS NOT NULL
-                    ORDER BY metadata->>'source_created_at' DESC 
+                    ORDER BY metadata->>'source_created_at' DESC
                     LIMIT 1;
                 """)
                 res = cur.fetchone()
@@ -141,6 +140,7 @@ class VectorStore:
         query_text: str = "",
         source_collection: Optional[str] = None,
         doc_ids: Optional[List[str]] = None,
+        cutoff_date: Optional[datetime] = None,
     ) -> List[Dict[str, Any]]:
         """Cosine similarity search.
 
@@ -150,40 +150,47 @@ class VectorStore:
         """
         if not query_vector:
             return []
-            
+
         if len(query_vector) != 768:
             raise ValueError(f"Query vector must be 768 dimensions, got {len(query_vector)}")
-            
+
         query_norm = math.sqrt(sum(x * x for x in query_vector))
         if query_norm == 0:
             return []
 
+        q_norm_vec = [x / query_norm for x in query_vector]
+
         sql = """
+            WITH q AS (
+                SELECT %s::DOUBLE PRECISION[] AS vec
+            )
             SELECT
                 text,
                 metadata,
-                cosine_similarity(
-                    %s::DOUBLE PRECISION[],
-                    %s::DOUBLE PRECISION,
-                    embedding,
-                    embedding_norm
-                ) AS score
-            FROM vector_embeddings
+                (
+                    SELECT sum(q * d)
+                    FROM unnest(q.vec, embedding) AS u(q, d)
+                ) / NULLIF(embedding_norm, 0) AS score
+            FROM vector_embeddings, q
         """
-        params = [query_vector, query_norm]
-        
+        params = [q_norm_vec]
+
         where_clauses = []
         if source_collection:
             where_clauses.append("metadata->>'source_collection' = %s")
             params.append(source_collection)
-            
+
         if doc_ids:
             where_clauses.append("document_id = ANY(%s)")
             params.append(doc_ids)
-            
+
+        if cutoff_date:
+            where_clauses.append("created_at >= %s")
+            params.append(cutoff_date)
+
         if where_clauses:
             sql += " WHERE " + " AND ".join(where_clauses)
-            
+
         sql += " ORDER BY score DESC LIMIT %s;"
         params.append(top_k)
 

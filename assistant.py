@@ -11,6 +11,7 @@ import logging
 import re
 import textwrap
 import time
+from datetime import datetime
 from typing import Dict, Any, List, Optional
 
 import requests
@@ -184,7 +185,7 @@ class Assistant:
 
     # -- public API ----------------------------------------------------------
 
-    def ask(self, question: str, doc_id_filter: Optional[set] = None) -> Dict[str, Any]:
+    def ask(self, question: str, doc_id_filter: Optional[set] = None, cutoff_date: Optional[datetime] = None) -> Dict[str, Any]:
         """Run the full RAG pipeline for a single question.
 
         If ``doc_id_filter`` is provided, retrieved chunks whose document_id
@@ -222,9 +223,9 @@ class Assistant:
             top_k=retrieve_k,
             query_text=question,
             source_collection=self.source_collection,
+            doc_ids=list(doc_id_filter) if doc_id_filter is not None else None,
+            cutoff_date=cutoff_date,
         )
-        if doc_id_filter is not None:
-            results = [r for r in results if str(r.get("metadata", {}).get("document_id", "")) in doc_id_filter][: self.top_k]
         if not results:
             return {
                 "answer": "I don't have that information in the selected collection.",
