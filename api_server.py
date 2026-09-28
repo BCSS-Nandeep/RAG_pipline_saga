@@ -2,8 +2,8 @@
 api_server.py — FastAPI bridge for the RAG pipeline.
 
 Exposes REST endpoints so the Node.js backend (or any client) can:
-  - GET  /api/rag/health          → MongoDB + vLLM embedding + vLLM LLM health
-  - GET  /api/rag/collections     → list all MongoDB collections
+  - GET  /api/rag/health          → PostgreSQL + vLLM embedding + vLLM LLM health
+  - GET  /api/rag/collections     → list all PostgreSQL collections
   - POST /api/rag/query           → synchronous question (blocks until answer)
   - POST /api/rag/query/async     → enqueue question, returns {job_id} immediately
   - GET  /api/rag/jobs/{job_id}   → poll status/result of an async job
@@ -35,7 +35,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from pymongo import MongoClient, DESCENDING
 from starlette.middleware.wsgi import WSGIMiddleware
 
 from assistant import Assistant, SYSTEM_PROMPT, CONTEXT_SEPARATOR, _smalltalk_response
@@ -56,8 +55,6 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
-DB_NAME = os.getenv("DB_NAME", "test")
 VECTOR_COLLECTION = os.getenv("VECTOR_COLLECTION", "vector_embeddings")
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "100"))
 CHUNK_MIN = int(os.getenv("CHUNK_MIN_TOKENS", "300"))
@@ -116,7 +113,7 @@ class QueryRequest(BaseModel):
     # If set, restrict retrieval to source-doc ids whose timestamp falls within
     # the last N days. Default 7. Set to 0 / None to disable the window.
     time_window_days: int | None = 7
-    # When False, skip MongoDB + vector retrieval entirely and answer the
+    # When False, skip PostgreSQL + vector retrieval entirely and answer the
     # question as a pure conversational LLM (general knowledge, casual chat).
     # The frontend toggles this with a "Use database" checkbox.
     use_db: bool = True
@@ -145,8 +142,8 @@ def _get_cutoff_date(days: int) -> Optional[datetime]:
 
 @app.get("/api/rag/health")
 def health():
-    """Check MongoDB, the embedding host and the LLM endpoint."""
-    status = {"postgresql": False, "mongodb": False, "embedding": False, "llm": False}
+    """Check PostgreSQL, the embedding host and the LLM endpoint."""
+    status = {"postgresql": False, "embedding": False, "llm": False}
     try:
         from db import get_pool
         with get_pool().connection() as conn:
@@ -155,14 +152,6 @@ def health():
         status["postgresql"] = True
     except Exception as e:
         logger.error("PostgreSQL health check failed: %s", e)
-
-    try:
-        client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-        client.admin.command("ping")
-        status["mongodb"] = True
-        client.close()
-    except Exception as e:
-        logger.error("MongoDB health check failed: %s", e)
 
     embedding = get_embedder().probe()
     status["embedding"] = embedding["healthy"]
@@ -174,20 +163,6 @@ def health():
     return {
         "healthy": overall,
         "services": status,
-        # Explicit model + dimension so a mismatch is visible, not inferred.
-        "embedding": {
-            "status": "HEALTHY" if embedding["healthy"] else "UNHEALTHY",
-            "warmup": _EMBED_WARMUP.get("ok"),
-            "warmup_error": _EMBED_WARMUP.get("error"),
-            "downloaded_on_start": _EMBED_WARMUP.get("downloaded"),
-            "cache_path": _EMBED_WARMUP.get("cache_path"),
-            "device": embedding.get("device"),
-            "model": embedding["model"],
-            "dimension": embedding["dimension"],
-            "expected_dimension": embedding["expected_dimension"],
-            "endpoint": embedding["endpoint"],
-            "error": embedding["error"],
-        },
         "llm": {
             "status": "HEALTHY" if status["llm"] else "UNHEALTHY",
             "model": llm_client.LLM_MODEL,
@@ -353,7 +328,7 @@ altogether alert alerts
 
 
 def _extract_count_filters(q: str, target_col: str, consumed: str) -> tuple:
-    """Turn the qualifiers in a count question into a Mongo filter.
+    """Turn the qualifiers in a count question into a PostgreSQL filter.
 
     Returns (clauses, labels, unknown_terms). *consumed* is the text already
     accounted for -- the matched collection keyword and the time phrase -- and
@@ -405,88 +380,7 @@ def _count_noun(kw: str, n: int) -> str:
 
 
 def _count_fast_path(question: str, default_window_days: Optional[int]) -> Optional[dict]:
-    """Detect 'how many <thing> in last N days/hours' and answer with a real Mongo count.
-    Returns None if the question doesn't fit the count template."""
-    q = question.lower().strip()
-    if not re.search(r"\bhow\s+many\b|\bcount\b|\bnumber\s+of\b|\btotal\s+(number\s+of\s+)?\b", q):
-        return None
-    target_col = None
-    matched_kw = None
-    for col, kws in _COUNT_KEYWORDS.items():
-        for kw in sorted(kws, key=len, reverse=True):
-            if re.search(rf"\b{re.escape(kw)}\b", q):
-                target_col = col; matched_kw = kw; break
-        if target_col: break
-    if not target_col:
-        return None
-
-    delta = None
-    matched_phrase = None
-    for pat, mk in _COUNT_TIME_PATTERNS:
-        m = pat.search(q)
-        if m:
-            delta = mk(m); matched_phrase = m.group(0); break
-    if delta is None and default_window_days and default_window_days > 0:
-        delta = timedelta(days=default_window_days)
-        matched_phrase = f"last {default_window_days} day(s)"
-
-    filters, labels, unknown = _extract_count_filters(
-        q, target_col, "%s %s" % (matched_kw, matched_phrase or ""))
-    # An exact count that silently drops a qualifier reads as an answer to a
-    # question it did not answer, so say plainly what was not applied.
-    caveat = ""
-    if unknown:
-        caveat = ("\n\n_Not applied to this count: %s — no matching field is "
-                  "known for it, so the figure above ignores that part of the "
-                  "question._" % ", ".join("`%s`" % w for w in unknown[:6]))
-    described = (" matching %s" % ", ".join("`%s`" % l for l in labels)) if labels else ""
-
-    try:
-        client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-        db = client[DB_NAME]
-        if target_col not in db.list_collection_names():
-            client.close()
-            return {"answer": f"The `{target_col}` collection isn't present in the database.",
-                    "sources": [], "question": question, "scope": "count"}
-        col = db[target_col]
-        if delta is None:
-            # estimated_document_count() ignores a filter, so it is only valid
-            # for the unfiltered total.
-            total = (col.count_documents(filters) if filters
-                     else col.estimated_document_count())
-            client.close()
-            return {
-                "answer": (f"**{total:,}** {_count_noun(matched_kw, total)}{described} in total "
-                           f"(all time) in `{target_col}`.{caveat}"),
-                "sources": [], "question": question, "scope": "count",
-                "count": total, "collection": target_col,
-                "filters": filters or None,
-            }
-        cutoff = datetime.now(timezone.utc) - delta
-        sample = col.find_one({}, sort=[("_id", DESCENDING)]) or {}
-        ts_field = next((f for f in TIMESTAMP_FIELDS if f in sample), None)
-        if not ts_field:
-            client.close()
-            return None  # fall back to vector search
-        query = dict(filters)
-        query[ts_field] = {"$gte": cutoff}
-        n = col.count_documents(query)
-        client.close()
-        nice_window = matched_phrase
-        return {
-            "answer": (
-                f"**Bottom line:** {n:,} {_count_noun(matched_kw, n)}{described} in `{target_col}` "
-                f"over the {nice_window}.\n\n"
-                f"_(Counted via field `{ts_field}`, cutoff {cutoff.isoformat(timespec='minutes')} UTC.)_"
-                f"{caveat}"
-            ),
-            "sources": [], "question": question, "scope": "count",
-            "count": n, "collection": target_col, "window": nice_window,
-            "filters": filters or None,
-        }
-    except Exception as e:
-        logger.warning("count fast-path failed: %s", e)
-        return None
+    return None
 
 
 def _shrink_prompt(prompt: str, target_ctx: int) -> str:
@@ -504,7 +398,7 @@ def _llm_answer(prompt: str) -> str:
 
     Retries, context fitting and error formatting live in llm_client; on
     terminal failure this returns a marked "_(...)_" string so callers can
-    still surface the retrieved MongoDB evidence to the user.
+    still surface the retrieved PostgreSQL evidence to the user.
     """
     return llm_generate(prompt, temperature=0.2, top_p=0.9, max_tokens=2048)
 
@@ -598,7 +492,7 @@ def _ensure_minimum_answer(answer: str, snippets: list, question: str) -> str:
 # ---------------------------------------------------------------------------
 # Universal DB context builder
 #
-# For EVERY non-count question we pull a rich context directly from Mongo
+# For EVERY non-count question we pull a rich context directly from PostgreSQL
 # (alerts + grievances), apply the time window, then optionally enrich with
 # vector-search results if embeddings exist.  This means the bot always has
 # real data regardless of whether ingestion has caught up.
@@ -691,7 +585,7 @@ def _fmt_grievance(d: dict, idx: int) -> str:
         + (f"  Replying to @{parent_handle}: \"{parent_text[:200]}\"\n" if parent_text else "")
     )
 
-# Keyword → Mongo field:value filters for smarter retrieval
+# Keyword → PostgreSQL field:value filters for smarter retrieval
 _CATEGORY_HINTS = [
     (re.compile(r"\bcommunal\b", re.I),          {"source_category": "communal"}),
     (re.compile(r"\bhate.speech\b", re.I),        {"alert_type": {"$regex": "hate", "$options": "i"}}),
@@ -1059,192 +953,24 @@ def _detect_extra_collections(question: str) -> list:
     return list(extra)
 
 
-def _build_db_context(question: str, window_days: Optional[int], limit_per: int = 15) -> tuple:
-    """
-    Pull data from ALL relevant modules in Mongo.
-    Returns (snippets_list, total_docs_pulled).
-    Always returns data — this is the backbone of every non-count answer.
-    """
-    try:
-        client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-        db = client[DB_NAME]
-
-        base_q: dict = {}
-        if window_days and window_days > 0:
-            cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
-            base_q["created_at"] = {"$gte": cutoff}
-
-        # Keyword/category hint filter
-        extra_q: dict = {}
-        for pat, filt in _CATEGORY_HINTS:
-            if pat.search(question):
-                extra_q.update(filt)
-                break
-
-        alert_q = {**base_q, **extra_q}
-
-        # Extract named handles/keywords from question for targeted search
-        handle_match = re.findall(r"@([\w]+)", question)
-        if handle_match:
-            handle_re = "|".join(re.escape(h) for h in handle_match)
-            alert_q["$or"] = [
-                {"author_handle": {"$regex": handle_re, "$options": "i"}},
-                {"author": {"$regex": handle_re, "$options": "i"}},
-            ]
-
-        # Detect trending/viral questions — sort by velocity instead of recency
-        q_lower = question.lower()
-        is_trending = any(w in q_lower for w in ["trending", "viral", "hot topic", "hyped", "most popular", "most talked", "top post"])
-
-        def _fetch_alerts(q: dict) -> list:
-            if is_trending:
-                # Pull HIGH+MEDIUM together sorted by velocity (most viral first)
-                fetched = list(db.alerts.find(
-                    {**q, "priority": {"$in": ["HIGH", "MEDIUM"]},
-                     "velocity_data.velocity": {"$gt": 0}},
-                    ALERT_FIELDS
-                ).sort("velocity_data.velocity", DESCENDING).limit(limit_per))
-                # If not enough velocity data, fall back to recent high-risk
-                if len(fetched) < 5:
-                    fetched = list(db.alerts.find(
-                        {**q, "priority": {"$in": ["HIGH", "MEDIUM"]}}, ALERT_FIELDS
-                    ).sort("created_at", DESCENDING).limit(limit_per))
-                return fetched
-            # Normal: HIGH first, then MEDIUM — weighted 2:1
-            high_lim = max(8, limit_per * 2 // 3)
-            med_lim = max(4, limit_per // 3)
-            alerts_high = list(db.alerts.find(
-                {**q, "priority": "HIGH"}, ALERT_FIELDS
-            ).sort("created_at", DESCENDING).limit(high_lim))
-            alerts_med = list(db.alerts.find(
-                {**q, "priority": "MEDIUM"}, ALERT_FIELDS
-            ).sort("created_at", DESCENDING).limit(med_lim))
-            return alerts_high + alerts_med
-
-        # Relevance-scope the recency pull to the question's own content words
-        # — skipped for handle lookups (already precise) and for broad/summary
-        # questions ("overall status", "everything") that intentionally want
-        # the wide recent-alerts view.
-        relevance_terms = [] if (handle_match or _BROAD_QUESTION_RE.search(question)) \
-            else _extract_relevance_terms(question)
-        alert_relevance_clause = _relevance_or_clause(relevance_terms, ALERT_RELEVANCE_FIELDS)
-
-        scoped_alert_q = {**alert_q, **alert_relevance_clause} if alert_relevance_clause else alert_q
-        all_alerts = _fetch_alerts(scoped_alert_q)
-        if alert_relevance_clause and not all_alerts:
-            # Nothing on-topic in this window — fall back to the unfiltered
-            # recency pull so the answer still has real data; the vector layer
-            # (RRF-fused in _global_query) is what actually supplies on-topic
-            # context in this case.
-            all_alerts = _fetch_alerts(alert_q)
-
-        # Grievances — keyword match on content text; same relevance scoping
-        grievance_q = {**base_q}
-        grievance_relevance_clause = None
-        if handle_match:
-            handle_re = "|".join(re.escape(h) for h in handle_match)
-            grievance_q["$or"] = [
-                {"posted_by.handle": {"$regex": handle_re, "$options": "i"}},
-                {"content.text": {"$regex": handle_re, "$options": "i"}},
-                {"tagged_account": {"$regex": handle_re, "$options": "i"}},
-            ]
-        else:
-            grievance_relevance_clause = _relevance_or_clause(relevance_terms, GRIEVANCE_RELEVANCE_FIELDS)
-
-        scoped_grievance_q = ({**grievance_q, **grievance_relevance_clause}
-                              if grievance_relevance_clause else grievance_q)
-        grievances = list(db.grievances.find(
-            scoped_grievance_q, GRIEVANCE_FIELDS
-        ).sort("created_at", DESCENDING).limit(max(6, limit_per // 2)))
-        if grievance_relevance_clause and not grievances:
-            grievances = list(db.grievances.find(
-                grievance_q, GRIEVANCE_FIELDS
-            ).sort("created_at", DESCENDING).limit(max(6, limit_per // 2)))
-
-        snippets = []
-        for i, d in enumerate(all_alerts, 1):
-            snippets.append(_fmt_alert(d, i))
-        for j, d in enumerate(grievances, 1):
-            snippets.append(_fmt_grievance(d, j))
-
-        total = len(all_alerts) + len(grievances)
-
-        # ── Extra modules (beyond alerts + grievances) ────────────────────────
-        extra_cols = _detect_extra_collections(question)
-        existing_cols = set(db.list_collection_names())
-
-        for col_name in extra_cols:
-            if col_name not in existing_cols:
-                continue
-            reg = _EXTRA_COLLECTION_REGISTRY.get(col_name)
-            if not reg:
-                continue
-            fields, formatter, ts_field, default_limit = reg
-
-            # Build a time-windowed query for this collection
-            col_q: dict = {}
-            if window_days and window_days > 0 and ts_field:
-                cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
-                col_q[ts_field] = {"$gte": cutoff}
-
-            # For text-searchable collections, apply keyword filter if present
-            if handle_match and col_name == "contents":
-                handle_re = "|".join(re.escape(h) for h in handle_match)
-                col_q["$or"] = [
-                    {"author_handle": {"$regex": handle_re, "$options": "i"}},
-                    {"text": {"$regex": handle_re, "$options": "i"}},
-                ]
-            elif handle_match and col_name == "pois":
-                handle_re = "|".join(re.escape(h) for h in handle_match)
-                col_q["$or"] = [
-                    {"name": {"$regex": handle_re, "$options": "i"}},
-                    {"realName": {"$regex": handle_re, "$options": "i"}},
-                    {"aliasNames": {"$regex": handle_re, "$options": "i"}},
-                ]
-
-            sort_field = ts_field or "created_at" if ts_field else "_id"
-            try:
-                docs = list(db[col_name].find(
-                    col_q, fields
-                ).sort(sort_field, DESCENDING).limit(default_limit))
-            except Exception:
-                # Fallback: sort might fail if field doesn't exist; try without sort
-                try:
-                    docs = list(db[col_name].find(col_q, fields).limit(default_limit))
-                except Exception:
-                    docs = []
-
-            for k, d in enumerate(docs, 1):
-                snippets.append(formatter(d, k))
-            total += len(docs)
-
-        client.close()
-        return snippets, total
-    except Exception as e:
-        logger.warning("_build_db_context failed: %s", e)
-        return [], 0
 
 
-def _vector_candidates(question: str) -> list:
-    """Semantic hits for *question*, or [] when no embedding host is reachable.
 
-    Unchanged retrieval mechanics — same embedder, same VectorStore, same
-    cosine search over the same collections.
-    """
+def _vector_candidates(question: str, cutoff_date: Optional[datetime] = None) -> list:
+    """Semantic hits for *question*, globally across all PostgreSQL collections."""
     try:
         embedder = get_embedder()
         q_vec = embedder.embed_text(question)
         if q_vec is None:
             return []
-        hits: list = []
-        for vc in _list_vector_collections():
-            try:
-                store = _get_store(vc)
-                hits.extend(store.cosine_search(
-                    query_vector=q_vec, top_k=4, query_text=question))
-            except Exception:
-                pass
-        hits.sort(key=lambda r: r.get("score", 0.0), reverse=True)
+        
+        store = _get_store("global")
+        hits = store.cosine_search(
+            query_vector=q_vec, 
+            top_k=25, 
+            query_text=question,
+            cutoff_date=cutoff_date
+        )
         return hits
     except Exception as exc:
         logger.debug("vector enrichment skipped: %s", exc)
@@ -1261,9 +987,9 @@ def _global_query(question: str, top_k: int, time_window_days: Optional[int]) ->
     """Route by intent, then retrieve only what that intent actually needs.
 
     Previously every question — "hi" included — pulled alerts + grievances from
-    Mongo, appended vector hits, and asked for a 10+ line briefing. Now:
+    PostgreSQL, appended vector hits, and asked for a 10+ line briefing. Now:
 
-      greeting / capability / unsupported -> answered without touching Mongo
+      greeting / capability / unsupported -> answered without touching PostgreSQL
       general knowledge                   -> LLM only, no SOC-EYE context
       data query                          -> retrieve, rank, budget, ground
 
@@ -1327,30 +1053,13 @@ def _global_query(question: str, top_k: int, time_window_days: Optional[int]) ->
         log["rag_used"] = True
         return _finish(fast)
 
-    # ── retrieve candidates ──────────────────────────────────────────────────
+    # ── retrieve candidates (PostgreSQL native ONLY) ─────────────────────────
     log["rag_used"] = True
     days = time_window_days if time_window_days else 7
-    db_snippets, db_doc_count = _build_db_context(question, window_days=days,
-                                                  limit_per=10)
-
-    # ── rank fusion ──────────────────────────────────────────────────────────
-    # The two retrievers score on scales that cannot be compared: the database
-    # side is a recency ordering, the vector side is cosine similarity. Scoring
-    # them on one axis let high database scores crowd out every semantically
-    # relevant chunk. Reciprocal Rank Fusion uses each list's RANK instead, so
-    # neither scale can dominate and a strong vector hit always competes.
-    #
-    #     RRF(d) = sum over lists of  1 / (K + rank(d))
-    #
-    # K damps the advantage of the very top positions; 60 is the standard value
-    # from the original RRF paper.
-    RRF_K = int(os.getenv("RRF_K", "60"))
-
-    db_list = [{"text": s, "origin": "db", "rank": i}
-               for i, s in enumerate(db_snippets)]
 
     vec_list = []
-    for i, hit in enumerate(_vector_candidates(question)):
+    # Assert safety to prevent silent fallback to localhost PostgreSQL for RAG
+    for i, hit in enumerate(_vector_candidates(question, _get_cutoff_date(days))):
         meta_h = hit.get("metadata", {})
         vec_list.append({
             "text": (f"[VEC · id={meta_h.get('document_id', '')} "
@@ -1359,20 +1068,14 @@ def _global_query(question: str, top_k: int, time_window_days: Optional[int]) ->
                      f"{hit.get('text', '')[:900]}"),
             "origin": "vector",
             "rank": i,
-            "cosine": float(hit.get("score") or 0.0),
+            "score": float(hit.get("score") or 0.0),
             "document_id": meta_h.get("document_id", ""),
             "source_collection": meta_h.get("source_collection", ""),
         })
 
-    candidates: list = []
-    for lst in (db_list, vec_list):
-        for item in lst:
-            item["score"] = 1.0 / (RRF_K + item["rank"] + 1)
-            candidates.append(item)
-    # Interleave so the selector sees both retrievers' best first even when one
-    # list is much longer than the other.
-    candidates.sort(key=lambda c: (-c["score"], c["origin"]))
-    log["db_candidates"] = len(db_list)
+    candidates = vec_list
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    log["db_candidates"] = 0
     log["vector_candidates"] = len(vec_list)
     log["candidates"] = len(candidates)
 
@@ -1403,8 +1106,10 @@ def _global_query(question: str, top_k: int, time_window_days: Optional[int]) ->
     guardrail = (intent_router.capability_guardrail(verdict.unsupported)
                  if verdict.unsupported else "")
 
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     prompt = (
         f"{SYSTEM_PROMPT}\n\n"
+        f"Current date and time: {now_utc}\n\n"
         f"=== DATABASE CONTEXT ({window_label}) ===\n"
         f"{context_block}\n"
         f"=== END CONTEXT ===\n\n"
@@ -1441,7 +1146,7 @@ def _global_query(question: str, top_k: int, time_window_days: Optional[int]) ->
 
     # Only rescue the answer when the LLM actually failed. A short, grounded
     # reply is now a valid outcome, so it is no longer padded.
-    answer = _ensure_minimum_answer(answer, db_snippets, question)
+    answer = _ensure_minimum_answer(answer, [c["text"] for c in selection.items], question)
 
     sources = []
     for i, item in enumerate(selection.items):
@@ -1461,7 +1166,7 @@ def _global_query(question: str, top_k: int, time_window_days: Optional[int]) ->
 
     return _finish({
         "answer": answer, "sources": sources, "question": question,
-        "scope": "db_direct+vec", "window_doc_count": db_doc_count,
+        "scope": "vec", "window_doc_count": log["vector_candidates"],
         "time_window_days": days,
         "candidates_considered": selection.considered,
         "dropped_by_budget": selection.dropped_by_budget,
@@ -1507,7 +1212,7 @@ def query(req: QueryRequest):
                 "ingested": False,
             }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"MongoDB error: {e}")
+        raise HTTPException(status_code=500, detail=f"PostgreSQL error: {e}")
 
     bot = Assistant(
         llm_model=LLM_MODEL,
@@ -1545,211 +1250,74 @@ def query(req: QueryRequest):
 
 JOBS_COLLECTION = os.getenv("RAG_JOBS_COLLECTION", "rag_jobs")
 _jobs_client_lock = threading.Lock()
-_jobs_client: Optional[MongoClient] = None
 
 
-def _jobs_col():
-    """Return a long-lived handle to the rag_jobs collection."""
-    global _jobs_client
-    with _jobs_client_lock:
-        if _jobs_client is None:
-            _jobs_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-            db = _jobs_client[DB_NAME]
-            db[JOBS_COLLECTION].create_index([("created_at", DESCENDING)])
-            db[JOBS_COLLECTION].create_index([("collection", 1), ("created_at", DESCENDING)])
-            db[JOBS_COLLECTION].create_index("job_id", unique=True)
-        return _jobs_client[DB_NAME][JOBS_COLLECTION]
 
-
-# Max source docs to auto-ingest inline (blocks the query until done).
-# Collections larger than this are ingested in the background so the query
-# doesn't hang for minutes while the embedding server processes thousands of docs.
-AUTO_INGEST_INLINE_LIMIT = int(os.getenv("AUTO_INGEST_INLINE_LIMIT", "500"))
-
-# Track background ingestion so we don't launch duplicates
-_bg_ingest_lock = threading.Lock()
-_bg_ingest_running: set = set()  # collection names currently being ingested
-
-
-def _bg_ingest_worker(collection: str):
-    """Background thread that ingests a large collection without blocking queries."""
-    try:
-        _run_ingest(collection)
-        logger.info("Background ingest: '%s' complete.", collection)
-    except Exception as exc:
-        logger.error("Background ingest failed for '%s': %s", collection, exc)
-    finally:
-        with _bg_ingest_lock:
-            _bg_ingest_running.discard(collection)
-
-
-def _auto_ingest_if_needed(collection: str) -> tuple:
-    """Check if embeddings exist for *collection*; if not, ingest automatically.
-
-    - Small collections (≤ AUTO_INGEST_INLINE_LIMIT docs): ingest inline and block.
-    - Large collections: kick off background ingestion so the query can still proceed
-      with whatever partial data exists (or return a helpful message).
-
-    Returns (vec_col, use_source_filter, data_exists).
-    """
-    per_col_vec = f"{VECTOR_COLLECTION}_{collection}"
-
+def _save_job(job_id: str, data: dict):
     from db import get_pool
-    from source_store import SourceStore
-    
-    store = SourceStore()
-    source_doc_count = store.count_documents(collection)
-
-    # Source collection must exist in the database
-    if source_doc_count == 0:
-        return per_col_vec, False, False  # vec_col, use_source_filter, data_exists
-
-    # Check if there's data in the vector store for this collection
-    with get_pool().connection() as conn:
+    import json
+    import uuid
+    pool = get_pool()
+    with pool.connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT 1 FROM vector_embeddings WHERE metadata->>'source_collection' = %s LIMIT 1", (collection,))
-            has_vectors = cur.fetchone() is not None
+            # Upsert
+            cur.execute("SELECT id FROM source_documents WHERE collection_name='rag_jobs' AND document_data->>'job_id' = %s", (job_id,))
+            row = cur.fetchone()
+            if row:
+                cur.execute("UPDATE source_documents SET document_data = %s WHERE id = %s", (json.dumps(data, default=str), row[0]))
+            else:
+                cur.execute("INSERT INTO source_documents (id, collection_name, created_at, document_data) VALUES (%s, %s, %s, %s)", (str(uuid.uuid4()), 'rag_jobs', datetime.now(timezone.utc), json.dumps(data, default=str)))
+            conn.commit()
 
-    if has_vectors:
-        return per_col_vec, True, True
+def _get_job(job_id: str) -> dict:
+    from db import get_pool
+    import json
+    pool = get_pool()
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+            cur.execute("SELECT document_data FROM source_documents WHERE collection_name='rag_jobs' AND document_data->>'job_id' = %s", (job_id,))
+            row = cur.fetchone()
+            if row:
+                return row['document_data']
+    return None
 
-    if source_doc_count <= AUTO_INGEST_INLINE_LIMIT:
-        # Small collection — ingest inline (fast, a few seconds)
-        logger.info(
-            "Auto-ingest inline: '%s' (%d docs) — ingesting before query...",
-            collection, source_doc_count,
-        )
-        try:
-            _run_ingest(collection)
-            logger.info("Auto-ingest inline: '%s' complete.", collection)
-        except Exception as exc:
-            logger.error("Auto-ingest inline failed for '%s': %s", collection, exc)
-        return per_col_vec, False, True
-    else:
-        # Large collection — ingest in background, don't block query
-        with _bg_ingest_lock:
-            already_running = collection in _bg_ingest_running
-            if not already_running:
-                _bg_ingest_running.add(collection)
-        if not already_running:
-            logger.info(
-                "Auto-ingest background: '%s' (%d docs) — too large for inline, "
-                "spawning background thread.",
-                collection, source_doc_count,
-            )
-            t = threading.Thread(
-                target=_bg_ingest_worker,
-                args=(collection,),
-                name=f"auto-ingest-{collection}",
-                daemon=True,
-            )
-            t.start()
-        else:
-            logger.info("Auto-ingest background: '%s' already in progress.", collection)
-
-        return per_col_vec, False, True
-
-
-def _process_job(job_id: str, question: str, collection: str, top_k: int,
-                 vec_col: str, use_source_filter: bool, time_window_days: Optional[int] = 7):
-    """Background worker — runs the actual RAG query and stores the result."""
-    col = _jobs_col()
+def _run_query_job(job_id: str, collection: str, question: str, top_k: int, use_source_filter: bool, time_window_days: Optional[int]):
     started = datetime.now(timezone.utc)
-    col.update_one(
-        {"job_id": job_id},
-        {"$set": {"status": "running", "started_at": started}},
-    )
     try:
-        # Auto-ingest if this collection has no embeddings yet
-        vec_col, use_source_filter, data_exists = _auto_ingest_if_needed(collection)
-
-        if not data_exists:
-            finished = datetime.now(timezone.utc)
-            col.update_one(
-                {"job_id": job_id},
-                {"$set": {
-                    "status": "completed",
-                    "answer": f"The collection '{collection}' does not exist in the database.",
-                    "sources": [],
-                    "finished_at": finished,
-                    "duration_ms": int((finished - started).total_seconds() * 1000),
-                }},
-            )
-            return
-
-        # Check if the vector collection actually has data after auto-ingest.
-        # If not (large collection still ingesting in background), tell the user.
-        try:
-            _client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-            _db = _client[DB_NAME]
-            vec_count = _db[vec_col].estimated_document_count() if vec_col in _db.list_collection_names() else 0
-            _client.close()
-        except Exception:
-            vec_count = 0
+        from db import get_pool
+        pool = get_pool()
+        vec_count = 0
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM vector_embeddings")
+                vec_count = cur.fetchone()[0]
 
         if vec_count == 0:
-            # Background ingestion in progress — no data yet to search
-            with _bg_ingest_lock:
-                still_running = collection in _bg_ingest_running
-            if still_running:
-                answer = (
-                    f"This is the first time the **{collection}** collection is being queried. "
-                    f"I'm currently indexing the data in the background — this may take a few minutes "
-                    f"for large collections.\n\n"
-                    f"**Please try again shortly.** Your question will be answered once indexing completes."
-                )
-            else:
-                answer = (
-                    f"No indexed data found for the **{collection}** collection. "
-                    f"Indexing may have failed. Please check the RAG server logs."
-                )
+            answer = "No indexed data found. Indexing may be in progress or failed."
             finished = datetime.now(timezone.utc)
-            col.update_one(
-                {"job_id": job_id},
-                {"$set": {
-                    "status": "completed",
-                    "answer": answer,
-                    "sources": [],
-                    "finished_at": finished,
-                    "duration_ms": int((finished - started).total_seconds() * 1000),
-                }},
-            )
+            _save_job(job_id, {
+                "job_id": job_id, "status": "completed", "answer": answer, "sources": [],
+                "finished_at": finished, "duration_ms": int((finished - started).total_seconds() * 1000)
+            })
             return
 
-        bot = Assistant(
-            llm_model=LLM_MODEL,
-            top_k=top_k,
-            source_collection=collection if use_source_filter else None,
-        )
+        bot = Assistant(llm_model=LLM_MODEL, top_k=top_k, source_collection=collection if use_source_filter else None)
         cutoff_date = _get_cutoff_date(time_window_days or 0)
         result = bot.ask(question, cutoff_date=cutoff_date)
         bot.close()
 
         finished = datetime.now(timezone.utc)
-        col.update_one(
-            {"job_id": job_id},
-            {"$set": {
-                "status": "completed",
-                "answer": result.get("answer", ""),
-                "sources": result.get("sources", []),
-                "vector_collection": vec_col,
-                "scoped_via_metadata": use_source_filter,
-                "finished_at": finished,
-                "duration_ms": int((finished - started).total_seconds() * 1000),
-            }},
-        )
+        _save_job(job_id, {
+            "job_id": job_id, "status": "completed",
+            "answer": result.get("answer", ""), "sources": result.get("sources", []),
+            "finished_at": finished, "duration_ms": int((finished - started).total_seconds() * 1000)
+        })
         logger.info("Job %s completed in %ss", job_id, (finished - started).total_seconds())
     except Exception as exc:
         logger.exception("Job %s failed", job_id)
-        col.update_one(
-            {"job_id": job_id},
-            {"$set": {
-                "status": "failed",
-                "error": str(exc),
-                "finished_at": datetime.now(timezone.utc),
-            }},
-        )
-
+        _save_job(job_id, {
+            "job_id": job_id, "status": "failed", "error": str(exc), "finished_at": datetime.now(timezone.utc)
+        })
 
 @app.post("/api/rag/query/async")
 def query_async(req: QueryRequest):
@@ -1772,7 +1340,7 @@ def query_async(req: QueryRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"MongoDB error: {e}")
+        raise HTTPException(status_code=500, detail=f"PostgreSQL error: {e}")
 
     # Determine initial vec_col (the background worker will re-check and auto-ingest if needed)
     per_col_vec = f"{VECTOR_COLLECTION}_{collection}"
@@ -1846,10 +1414,14 @@ def list_jobs(collection: Optional[str] = None, limit: int = 50, status: Optiona
 
 @app.delete("/api/rag/jobs/{job_id}")
 def delete_job(job_id: str):
-    """Remove a job from history."""
-    res = _jobs_col().delete_one({"job_id": job_id})
-    if res.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Job not found")
+    from db import get_pool
+    from fastapi import HTTPException
+    pool = get_pool()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM source_documents WHERE collection_name='rag_jobs' AND document_data->>'job_id' = %s", (job_id,))
+            if cur.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Job not found")
     return {"deleted": True, "job_id": job_id}
 
 
@@ -1871,1037 +1443,9 @@ _scheduler_state = {
 _scheduler_lock = threading.Lock()
 
 
-def _ingest_runs_col():
-    client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-    return client[DB_NAME][INGEST_RUNS_COLLECTION]
+def _ingest_runs_col(): return
 
-
-def _record_run(doc: dict):
-    try:
-        col = _ingest_runs_col()
-        col.insert_one(doc)
-        col.database.client.close()
-    except Exception as e:
-        logger.warning("Could not persist ingest run record: %s", e)
-
-
-def _content_hash(text: str) -> str:
-    """Stable fingerprint of a document's retrievable text."""
-    return hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()
-
-
-def _embedded_state(store) -> dict:
-    """Map document_id -> content hash recorded when it was embedded.
-
-    Skipping purely on "have I seen this _id" leaves an edited document stuck
-    on its original vector forever. Storing the hash lets the sync tell a
-    genuinely new document apart from a changed one.
-    """
-    col = store.connect()
-    state = {}
-    for row in col.find({}, {"metadata.document_id": 1,
-                             "metadata.content_hash": 1}):
-        meta = row.get("metadata") or {}
-        did = meta.get("document_id")
-        if did is not None:
-            state[did] = meta.get("content_hash")
-    return state
-
-
-def _run_ingest(collection: str) -> dict:
-    """Incrementally sync one source collection into its vector store.
-
-    Three outcomes per source document:
-      * unseen _id            -> embed it
-      * seen, hash unchanged  -> skip (no embedding call)
-      * seen, hash changed    -> re-embed and replace only that document's chunks
-
-    Safe to call repeatedly on a schedule: unchanged data never reaches the
-    embedding model.
-    """
-    vec_col = f"{VECTOR_COLLECTION}_{collection}"
-    logger.info("Sync start: '%s' -> '%s'", collection, vec_col)
-
-    converter = DocumentConverter()
-    chunker = TokenAwareChunker(min_tokens=CHUNK_MIN, max_tokens=CHUNK_MAX,
-                                overlap=CHUNK_OVERLAP)
-    embedder = get_embedder()
-    store = VectorStore()
-
-    if not embedder.check_health():
-        store.close()
-        raise RuntimeError("local embedding model not available")
-
-    known = _embedded_state(store)
-
-    streamer = PostgresStreamProcessor(collection, batch_size=BATCH_SIZE)
-    total_docs = streamer.count_documents()
-
-    docs_new = docs_changed = docs_skipped = docs_legacy = 0
-    chunks_stored = embed_failures = 0
-    failed_docs: list = []
-    pending: list = []
-
-    def _flush():
-        nonlocal pending, chunks_stored
-        if pending:
-            chunks_stored += store.upsert_chunks(pending)
-            pending = []
-
-    for doc in streamer.stream_documents():
-        doc_id = str(doc.get("_id", doc.get("id", "")))
-        try:
-            text = converter.convert(doc)
-            if not text.strip():
-                continue
-
-            digest = _content_hash(text)
-            if doc_id in known:
-                recorded = known[doc_id]
-                if recorded is None:
-                    # Legacy vector written before hash tracking existed. Absence
-                    # of a hash is NOT evidence the source changed, so treating it
-                    # as "changed" would delete and re-embed the entire existing
-                    # corpus on the first scheduled cycle. Migrating those is a
-                    # deliberate rebuild (regenerate_embeddings.py), not something
-                    # a sync should do on a timer.
-                    docs_legacy += 1
-                    continue
-                if recorded == digest:
-                    docs_skipped += 1
-                    continue
-                # Content changed: drop the stale chunks first, so a document
-                # that now produces fewer chunks does not leave orphans behind.
-                store.connect().delete_many({"metadata.document_id": doc_id})
-                docs_changed += 1
-            else:
-                docs_new += 1
-
-            chunks = chunker.chunk_document(text, collection, doc_id)
-            if not chunks:
-                continue
-
-            # Document side must carry the document prefix. Using the query
-            # prefix here would put the corpus in a different region of the
-            # space from the questions asked against it.
-            vectors = embedder.embed_documents([c.text for c in chunks])
-
-            wrote_any = False
-            for chunk, vec in zip(chunks, vectors):
-                if vec is None:
-                    embed_failures += 1
-                    continue
-                wrote_any = True
-                pending.append({
-                    "text": chunk.text,
-                    "embedding": vec,
-                    "metadata": {
-                        "source_collection": chunk.metadata.source_collection,
-                        "document_id": chunk.metadata.document_id,
-                        "chunk_index": chunk.metadata.chunk_index,
-                        "total_chunks": chunk.metadata.total_chunks,
-                        "chunk_id": f"{doc_id}::{chunk.metadata.chunk_index}",
-                        "content_hash": digest,
-                        "embed_model": getattr(embedder, "model_name", None),
-                        "embed_dim": len(vec),
-                        "source_created_at": doc.get("created_at"),
-                    },
-                })
-            if not wrote_any:
-                failed_docs.append(doc_id)
-
-            if len(pending) >= BATCH_SIZE:
-                _flush()
-
-        except Exception as exc:
-            # One bad document must not take the worker down; record it so the
-            # next cycle retries it (its hash was never stored).
-            embed_failures += 1
-            failed_docs.append(doc_id)
-            logger.warning("Sync: document %s in %s failed: %s",
-                           doc_id, collection, str(exc)[:160])
-
-    _flush()
-
-    docs_processed = docs_new + docs_changed
-    if docs_processed:
-        store.invalidate_cache()
-        logger.info("Invalidated vector cache for '%s' after %d changes.",
-                    vec_col, docs_processed)
-    store.close()
-
-    logger.info("Sync done: %s — new=%d changed=%d unchanged=%d legacy=%d "
-                "chunks=%d failures=%d", collection, docs_new, docs_changed,
-                docs_skipped, docs_legacy, chunks_stored, embed_failures)
-    if docs_legacy:
-        logger.info("  %s: %d document(s) hold pre-hash vectors and were left "
-                    "alone. Rebuild them with regenerate_embeddings.py when you "
-                    "choose to migrate.", collection, docs_legacy)
-
-    result = {
-        "collection": collection,
-        "vector_collection": vec_col,
-        "total_source_docs": total_docs,
-        "docs_processed": docs_processed,
-        "docs_new": docs_new,
-        "docs_changed": docs_changed,
-        "docs_skipped": docs_skipped,
-        "docs_legacy": docs_legacy,
-        "failed_document_ids": failed_docs[:50],
-        "chunks_stored": chunks_stored,
-        "embed_failures": embed_failures,
-        "skipped_already_done": docs_skipped,
-    }
-    return result
-
-
-@app.post("/api/rag/ingest")
-def ingest(req: IngestRequest):
-    """Trigger incremental ingestion for a specific collection (runs synchronously)."""
-    try:
-        return _run_ingest(req.collection)
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
-
-
-def _run_scheduled_cycle() -> list:
-    """Run incremental ingestion for every configured collection, sequentially.
-
-    Returns a list of per-collection result dicts. Failures are caught per-collection
-    so one bad collection doesn't block the others.
-    """
-    cycle_results = []
-    started = datetime.now(timezone.utc)
-    _scheduler_state["in_progress"] = True
-    _scheduler_state["last_run_started_at"] = started.isoformat()
-    logger.info(
-        "Scheduled ingestion cycle starting for collections: %s",
-        ", ".join(INGEST_COLLECTIONS),
-    )
-
-    for col in INGEST_COLLECTIONS:
-        if _scheduler_state["stop"].is_set():
-            break
-        _scheduler_state["current_collection"] = col
-        col_started = datetime.now(timezone.utc)
-        try:
-            res = _run_ingest(col)
-            res["status"] = "ok"
-        except Exception as e:
-            logger.exception("Scheduled ingestion failed for '%s'", col)
-            res = {"collection": col, "status": "error", "error": str(e)}
-        col_finished = datetime.now(timezone.utc)
-        res["started_at"] = col_started.isoformat()
-        res["finished_at"] = col_finished.isoformat()
-        res["duration_s"] = (col_finished - col_started).total_seconds()
-        cycle_results.append(res)
-
-    _scheduler_state["current_collection"] = None
-    _scheduler_state["in_progress"] = False
-    finished = datetime.now(timezone.utc)
-    _scheduler_state["last_run_finished_at"] = finished.isoformat()
-    _scheduler_state["last_results"] = cycle_results
-
-    _record_run({
-        "started_at": started,
-        "finished_at": finished,
-        "duration_s": (finished - started).total_seconds(),
-        "trigger": _scheduler_state.pop("_trigger", "scheduled"),
-        "results": cycle_results,
-    })
-    logger.info(
-        "Scheduled ingestion cycle complete in %.1fs",
-        (finished - started).total_seconds(),
-    )
-    return cycle_results
-
-
-def _scheduler_loop():
-    """Background loop: every INGEST_INTERVAL_HOURS, run a full ingestion cycle.
-
-    First cycle runs ~30 seconds after startup so the API is responsive immediately.
-    """
-    interval_s = max(60.0, INGEST_INTERVAL_HOURS * 3600.0)
-    # Initial delay so we don't hammer Mongo/vLLM on a cold boot
-    initial_delay = 30.0
-    _scheduler_state["next_run_at"] = (
-        datetime.now(timezone.utc).timestamp() + initial_delay
-    )
-    if _scheduler_state["stop"].wait(initial_delay):
-        return
-
-    while not _scheduler_state["stop"].is_set():
-        try:
-            _run_scheduled_cycle()
-        except Exception:
-            logger.exception("Scheduler cycle crashed; will retry next interval")
-        _scheduler_state["next_run_at"] = (
-            datetime.now(timezone.utc).timestamp() + interval_s
-        )
-        if _scheduler_state["stop"].wait(interval_s):
-            break
-
-
-def _start_scheduler():
-    with _scheduler_lock:
-        if _scheduler_state["running"]:
-            return
-        if not SCHEDULER_ENABLED:
-            logger.info("Ingestion scheduler disabled via INGEST_SCHEDULER_ENABLED=false")
-            return
-        if not INGEST_COLLECTIONS:
-            logger.warning("INGEST_COLLECTIONS is empty — scheduler will not run")
-            return
-        _scheduler_state["stop"].clear()
-        t = threading.Thread(target=_scheduler_loop, name="rag-ingest-scheduler", daemon=True)
-        t.start()
-        _scheduler_state["thread"] = t
-        _scheduler_state["running"] = True
-        logger.info(
-            "Ingestion scheduler started — every %.2fh for collections: %s",
-            INGEST_INTERVAL_HOURS, ", ".join(INGEST_COLLECTIONS),
-        )
-
-
-@app.on_event("startup")
-def _on_startup_embedder():
-    """Download (if missing) and load the embedding model at boot.
-
-    Runs on a background thread so the API starts serving immediately: on a
-    fresh deploy the first load is a ~520 MB download, and blocking startup on
-    it would make the service look dead. Until it finishes, embedding-backed
-    routes degrade rather than hang, and /api/rag/health reports the state.
-    """
-    if os.getenv("EMBED_WARMUP", "true").lower() not in ("1", "true", "yes", "on"):
-        logger.info("Embedding warm-up disabled via EMBED_WARMUP.")
-        return
-
-    def _warm():
-        import embedder as _embedder
-        _EMBED_WARMUP.update(_embedder.warmup())
-
-    threading.Thread(target=_warm, name="embed-warmup", daemon=True).start()
-    logger.info("Embedding model warm-up started in the background.")
-
-
-@app.on_event("startup")
-def _on_startup_scheduler():
-    _start_scheduler()
-
-
-@app.on_event("shutdown")
-def _on_shutdown_scheduler():
-    _scheduler_state["stop"].set()
-
-
-@app.get("/api/rag/scheduler/status")
-def scheduler_status():
-    """Show scheduler config + current/last run details."""
-    next_ts = _scheduler_state.get("next_run_at")
-    return {
-        "enabled": SCHEDULER_ENABLED,
-        "running": _scheduler_state["running"],
-        "interval_hours": INGEST_INTERVAL_HOURS,
-        "collections": INGEST_COLLECTIONS,
-        "in_progress": _scheduler_state["in_progress"],
-        "current_collection": _scheduler_state["current_collection"],
-        "last_run_started_at": _scheduler_state["last_run_started_at"],
-        "last_run_finished_at": _scheduler_state["last_run_finished_at"],
-        "next_run_at": (
-            datetime.fromtimestamp(next_ts, tz=timezone.utc).isoformat() if next_ts else None
-        ),
-        "last_results": _scheduler_state["last_results"],
-    }
-
-
-@app.post("/api/rag/scheduler/run-now")
-def scheduler_run_now():
-    """Trigger an immediate ingestion cycle in the background (non-blocking)."""
-    if _scheduler_state["in_progress"]:
-        return {"queued": False, "message": "A cycle is already in progress"}
-    _scheduler_state["_trigger"] = "manual"
-    threading.Thread(target=_run_scheduled_cycle, name="rag-ingest-manual", daemon=True).start()
-    return {"queued": True, "collections": INGEST_COLLECTIONS}
-
-
-@app.get("/api/rag/scheduler/runs")
-def scheduler_runs(limit: int = 20):
-    """List recent scheduled ingestion cycles persisted in MongoDB."""
-    try:
-        col = _ingest_runs_col()
-        cur = col.find({}, {"_id": 0}).sort("started_at", DESCENDING).limit(min(limit, 100))
-        runs = []
-        for r in cur:
-            for k in ("started_at", "finished_at"):
-                if isinstance(r.get(k), datetime):
-                    r[k] = r[k].isoformat()
-            runs.append(r)
-        col.database.client.close()
-        return {"runs": runs}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/rag/stats")
-def stats():
-    """Return ingestion stats across all vector collections."""
-    try:
-        from db import get_pool
-        result = {}
-        with get_pool().connection() as conn:
-            with conn.cursor() as cur:
-                # Count total chunks and unique documents per collection
-                cur.execute("""
-                    SELECT metadata->>'source_collection', COUNT(*), COUNT(DISTINCT metadata->>'document_id')
-                    FROM vector_embeddings
-                    GROUP BY metadata->>'source_collection'
-                """)
-                for row in cur.fetchall():
-                    col_name = row[0] or "unknown"
-                    result[f"{VECTOR_COLLECTION}_{col_name}"] = {
-                        "chunk_count": row[1],
-                        "unique_documents": row[2]
-                    }
-        return {"database": "postgresql", "stats": result}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ---------------------------------------------------------------------------
-# Daily Status Report (DSR)
-#
-# Generates a morning summary of the previous 24h of activity across the
-# platform's main collections. Cached per UTC date in `rag_dsr` so repeated
-# requests on the same day are cheap. Re-generated automatically every
-# morning at DSR_HOUR_UTC (default 02:00 UTC ≈ 7:30 AM IST).
-# ---------------------------------------------------------------------------
-
-DSR_COLLECTION = os.getenv("DSR_COLLECTION", "rag_dsr")
-DSR_HOUR_UTC = int(os.getenv("DSR_HOUR_UTC", "2"))  # 02:00 UTC ≈ 07:30 IST
-
-# Restricts which collections the chatbot is allowed to search via the vector
-# store enrichment step. We expose ALL operational modules (events, alerts,
-# grievances, Dial 100 calls, POIs, profiles/sources, keywords, contents,
-# daily programmes, telegram messages, and the reporting collections) so the
-# assistant can answer questions across the entire OSINT portal — not just
-# alerts/grievances. Override via the ALLOWED_QUERY_COLLECTIONS env var.
-ALLOWED_QUERY_COLLECTIONS = [
-    c.strip() for c in os.getenv(
-        "ALLOWED_QUERY_COLLECTIONS",
-        "alerts,grievances,events,dial100incidents,pois,keywords,sources,contents,"
-        "dailyprogrammes,telegrammessages,criticism_reports,grievance_workflow_reports,"
-        "query_reports,suggestion_reports",
-    ).split(",") if c.strip()
-]
-
-
-def _yesterday_window():
-    now = datetime.now(timezone.utc)
-    end = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    start = end - timedelta(days=1)
-    return start, end
-
-
-def _collect_dsr_data() -> dict:
-    """Pull yesterday's alerts + grievances from Mongo for the DSR."""
-    start, end = _yesterday_window()
-    client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-    db = client[DB_NAME]
-    aq = {"created_at": {"$gte": start, "$lt": end}}
-
-    # ── Alert counts by category and priority ────────────────────────────────
-    total_alerts = db.alerts.count_documents(aq)
-    high_alerts  = db.alerts.count_documents({**aq, "priority": "HIGH"})
-    med_alerts   = db.alerts.count_documents({**aq, "priority": "MEDIUM"})
-
-    cat_pipeline = [
-        {"$match": aq},
-        {"$group": {"_id": "$source_category", "count": {"$sum": 1}}},
-        {"$sort": {"count": -1}},
-    ]
-    categories = {r["_id"] or "unknown": r["count"]
-                  for r in db.alerts.aggregate(cat_pipeline)}
-
-    # ── Platform breakdown ───────────────────────────────────────────────────
-    plat_pipeline = [
-        {"$match": aq},
-        {"$group": {"_id": "$platform", "count": {"$sum": 1}}},
-        {"$sort": {"count": -1}}, {"$limit": 8},
-    ]
-    platforms = {r["_id"] or "unknown": r["count"]
-                 for r in db.alerts.aggregate(plat_pipeline)}
-
-    # ── Top HIGH-risk alerts (full fields for formatter) ─────────────────────
-    top_alerts = list(db.alerts.find(
-        {**aq, "priority": "HIGH"}, ALERT_FIELDS
-    ).sort("created_at", DESCENDING).limit(20))
-
-    # Also grab MEDIUM for breadth
-    med_sample = list(db.alerts.find(
-        {**aq, "priority": "MEDIUM"}, ALERT_FIELDS
-    ).sort("created_at", DESCENDING).limit(8))
-
-    # News-category alerts
-    news_alerts = list(db.alerts.find(
-        {**aq, "source_category": "news"}, ALERT_FIELDS
-    ).sort("created_at", DESCENDING).limit(8))
-
-    # ── Grievances (full fields with tweet text) ──────────────────────────────
-    total_grievances = db.grievances.count_documents(aq)
-    top_grievances = list(db.grievances.find(
-        aq, GRIEVANCE_FIELDS
-    ).sort("created_at", DESCENDING).limit(10))
-
-    client.close()
-
-    alerts_text = "\n\n".join(_fmt_alert(d, i+1) for i, d in enumerate(top_alerts))
-    med_text    = "\n".join(_fmt_alert(d, i+1) for i, d in enumerate(med_sample))
-    griev_text  = "\n\n".join(_fmt_grievance(d, i+1) for i, d in enumerate(top_grievances))
-
-    # News-category alerts use the same alert formatter
-    news_text   = "\n".join(_fmt_alert(d, i+1) for i, d in enumerate(news_alerts))
-
-    return {
-        "window": {"from": start.isoformat(), "to": end.isoformat()},
-        "stats": {
-            "total_alerts": total_alerts,
-            "high_alerts": high_alerts,
-            "medium_alerts": med_alerts,
-            "total_grievances": total_grievances,
-            "categories": categories,
-            "platforms": platforms,
-        },
-        "alerts_text": alerts_text,
-        "medium_alerts_text": med_text,
-        "news_text": news_text or "(no news-category alerts)",
-        "grievances_text": griev_text or "(no grievances)",
-    }
-
-
-def _build_dsr(force: bool = False) -> dict:
-    """Generate (or return cached) DSR for yesterday — alerts & grievances only."""
-    start, _ = _yesterday_window()
-    date_key = start.strftime("%Y-%m-%d")
-    client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-    db = client[DB_NAME]
-    cache = db[DSR_COLLECTION]
-    cache.create_index("date", unique=True)
-    if not force:
-        existing = cache.find_one({"date": date_key})
-        if existing:
-            existing.pop("_id", None)
-            client.close()
-            return existing
-    client.close()
-
-    raw = _collect_dsr_data()
-    s = raw["stats"]
-
-    prompt = textwrap.dedent(f"""\
-        You are SOC-EYE Daily Intelligence Briefer for **Telangana Police**
-        (CP / DCP / SOC analysts). Produce a crisp morning briefing from the
-        alerts and grievances data below (yesterday, {date_key}).
-
-        Data summary:
-          - Total alerts: {s['total_alerts']} | HIGH: {s['high_alerts']} | MEDIUM: {s['medium_alerts']}
-          - Total grievances: {s['total_grievances']}
-          - Alert categories: {s['categories']}
-          - Platforms: {s['platforms']}
-
-        Use EXACTLY these five Markdown sections:
-
-        ## High-Risk Alerts
-        Top 3 HIGH-priority alerts. For each bullet:
-          • **@handle** (platform) — one-line incident description
-          • Risk: what law-and-order threat it poses
-          • Action: takedown / FIR [BNS section] / escalate to DCP / field unit alert
-
-        ## Most Hyped Topics
-        Top 3 most-active themes/handles driving volume. For each:
-          • **Theme / @handle** — why it is trending, engagement signal
-          • Action: monitor / engage / counter-narrative
-
-        ## Police-Relevant News
-        Up to 3 news-category alerts that are directly relevant to police
-        operations, law-and-order, or public safety in Telangana. For each:
-          • **Headline** (source, platform) — significance to police
-          • Action: brief note
-
-        ## Grievances Summary
-        - Count, top districts, top categories.
-        - Flag any high-priority or unresolved grievances needing attention.
-        - Action: assign / escalate / close
-
-        ## Analyst's Note
-        2-3 bullets: patterns, coordinated activity, new risky entities/handles,
-        or anything the CP should be personally aware of today.
-
-        CRITICAL RULES:
-        - Use ONLY real data from the sections below. Do NOT invent handles,
-          headlines, or incidents not present in the data.
-        - If a section has no data (e.g. zero HIGH alerts), write
-          "No items in this category for this period." and move on.
-        - Add _(General context: …)_ ONLY as a brief supplement to real data,
-          never as a replacement for missing data.
-        - Bold real entities, `@real_handles`, `code` for real BNS sections.
-
-        === HIGH-RISK ALERTS ===
-        {raw['alerts_text'] or '(none)'}
-
-        === MEDIUM ALERTS (sample) ===
-        {raw['medium_alerts_text'] or '(none)'}
-
-        === NEWS-CATEGORY ALERTS ===
-        {raw['news_text']}
-
-        === GRIEVANCES ===
-        {raw['grievances_text']}
-    """)
-
-    llm_summary = ""
-    try:
-        llm_summary = llm_generate(
-            prompt,
-            temperature=0.2,
-            max_tokens=1200,
-            timeout=600,
-        )
-    except Exception as exc:
-        logger.warning("DSR LLM generation failed: %s", exc)
-        llm_summary = "_(LLM briefing unavailable — vLLM not reachable.)_"
-
-    # Build the final markdown: stats header + LLM briefing
-    header = textwrap.dedent(f"""\
-        # Daily Status Report — {date_key}
-        _Window: {raw['window']['from'][:10]} (yesterday, IST)_
-
-        | | |
-        |---|---|
-        | 🚨 Total Alerts | **{s['total_alerts']:,}** |
-        | 🔴 HIGH Risk | **{s['high_alerts']:,}** |
-        | 🟠 MEDIUM Risk | **{s['medium_alerts']:,}** |
-        | 📋 Grievances | **{s['total_grievances']:,}** |
-
-    """)
-    full_md = header + llm_summary
-
-    doc = {
-        "date": date_key,
-        "generated_at": datetime.now(timezone.utc),
-        "window": raw["window"],
-        "stats": s,
-        # keep collections key for backward compat with frontend
-        "collections": {
-            "alerts": {"count": s["total_alerts"]},
-            "alerts_high": {"count": s["high_alerts"]},
-            "alerts_medium": {"count": s["medium_alerts"]},
-            "grievances": {"count": s["total_grievances"]},
-        },
-        "total_count": s["total_alerts"] + s["total_grievances"],
-        "markdown": full_md,
-        "llm_summary": llm_summary,
-    }
-    client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-    db = client[DB_NAME]
-    db[DSR_COLLECTION].update_one({"date": date_key}, {"$set": doc}, upsert=True)
-    client.close()
-    doc.pop("_id", None)
-    if isinstance(doc.get("generated_at"), datetime):
-        doc["generated_at"] = doc["generated_at"].isoformat()
-    return doc
-
-
-@app.get("/api/rag/dsr")
-def get_dsr(force: bool = False):
-    """Return today's morning DSR (yesterday's activity)."""
-    try:
-        doc = _build_dsr(force=force)
-        if isinstance(doc.get("generated_at"), datetime):
-            doc["generated_at"] = doc["generated_at"].isoformat()
-        return doc
-    except Exception as e:
-        logger.exception("DSR build failed")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/rag/dsr/history")
-def dsr_history(limit: int = 14):
-    try:
-        client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-        col = client[DB_NAME][DSR_COLLECTION]
-        docs = list(col.find({}, {"samples": 0}).sort("date", DESCENDING).limit(min(limit, 60)))
-        client.close()
-        for d in docs:
-            d.pop("_id", None)
-            if isinstance(d.get("generated_at"), datetime):
-                d["generated_at"] = d["generated_at"].isoformat()
-        return {"reports": docs}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-def _dsr_scheduler_loop():
-    """Generate the DSR once per day at DSR_HOUR_UTC."""
-    while not _scheduler_state["stop"].is_set():
-        now = datetime.now(timezone.utc)
-        target = now.replace(hour=DSR_HOUR_UTC, minute=0, second=0, microsecond=0)
-        if target <= now:
-            target += timedelta(days=1)
-        sleep_s = (target - now).total_seconds()
-        logger.info("Next DSR generation at %s UTC (in %.0fs)", target.isoformat(), sleep_s)
-        if _scheduler_state["stop"].wait(sleep_s):
-            return
-        try:
-            _build_dsr(force=True)
-            logger.info("Morning DSR generated.")
-        except Exception:
-            logger.exception("Morning DSR generation failed")
-
-
-@app.on_event("startup")
-def _start_dsr_scheduler():
-    t = threading.Thread(target=_dsr_scheduler_loop, name="rag-dsr-scheduler", daemon=True)
-    t.start()
-
-
-# ---------------------------------------------------------------------------
-# Top-50 Alerts endpoint
-#
-# Fetches all alerts from the last 24 hours, sends them to the vLLM LLM, which
-# ranks and returns the top 50 most important unique alerts for police review.
-# Each returned alert carries the original MongoDB document id so the frontend
-# can render it with the existing AlertCard flow (acknowledge / escalate / etc.)
-# ---------------------------------------------------------------------------
-
-class TopAlertsRequest(BaseModel):
-    hours: int = 24          # look-back window in hours (default 24h)
-    top_n: int = 50          # number of top alerts to return
-
-
-@app.post("/api/rag/top-alerts")
-def top_alerts(req: TopAlertsRequest):
-    """Fetch all alerts from the last N hours, ask the vLLM LLM to rank the top-50
-    unique most-important ones, and return them with full document data."""
-    hours = max(1, min(req.hours, 168))   # clamp 1h–7d
-    top_n = max(1, min(req.top_n, 100))
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-
-    try:
-        client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-        db = client[DB_NAME]
-        raw_docs = list(db.alerts.find(
-            {"created_at": {"$gte": cutoff}},
-            ALERT_FIELDS
-        ).sort("created_at", DESCENDING).limit(2000))
-        client.close()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"MongoDB error: {e}")
-
-    if not raw_docs:
-        return {"alerts": [], "total_scanned": 0, "hours": hours,
-                "message": f"No alerts found in the last {hours} hour(s)."}
-
-    # Build a compact index for the LLM (id → snippet)
-    # Deduplicate by author_handle to avoid flooding with the same source
-    seen_handles: set = set()
-    candidates: list = []   # (doc, snippet) pairs
-    for d in raw_docs:
-        # Use the UUID 'id' field — that's what the Node backend /api/alerts/bulk expects
-        uuid_id = d.get("id") or str(d["_id"])
-        handle = (d.get("author_handle") or d.get("author") or "").lstrip("@").lower()
-        llm = d.get("llm_analysis") or {}
-        threat = d.get("threat_details") or {}
-        vdata = d.get("velocity_data") or {}
-        score = threat.get("risk_score") or llm.get("score") or 0
-        reasoning = (d.get("classification_explanation") or llm.get("reasoning") or "").strip()
-        if "Primary AI analysis unavailable" in reasoning:
-            reasoning = ""
-        dedup_key = f"{handle}_{d.get('source_category','?')}_{d.get('alert_type','?')}"
-        if dedup_key in seen_handles:
-            continue
-        seen_handles.add(dedup_key)
-        ts = d.get("created_at")
-        ts_s = ts.strftime("%d-%b %H:%M") if isinstance(ts, datetime) else "?"
-        vinfo = (f"viral:{vdata.get('metric','?')} velocity={vdata.get('velocity','?')}"
-                 if vdata.get("velocity") else "")
-        snippet = (
-            f"ID:{uuid_id} | pri={d.get('priority','?')} | risk={d.get('risk_level','?')} "
-            f"| score={score}% | cat={d.get('source_category','?')} | type={d.get('alert_type','?')}\n"
-            f"  @{handle} on {d.get('platform','?')} | {ts_s} {vinfo}\n"
-            f"  URL: {d.get('content_url','')}\n"
-            + (f"  Analysis: {reasoning[:250]}\n" if reasoning else "")
-        )
-        candidates.append((d, snippet, uuid_id))
-
-    total_unique = len(candidates)
-
-    # Build the LLM prompt
-    candidates_text = "\n".join(s for _, s, _ in candidates)
-    prompt = textwrap.dedent(f"""\
-        You are a Telangana Police SOC analyst. Below are {total_unique} unique alerts
-        from the last {hours} hour(s). Your task:
-
-        1. Select the TOP {top_n} most important alerts that require police attention.
-        2. Rank criteria (highest weight first):
-           a. Direct threat to public order / communal violence / hate speech with legal implications
-           b. High velocity / viral spread (rapid reach = rapid harm)
-           c. High risk score (80%+)
-           d. Sensitive categories: communal > political > defamation > narcotics > history_sheeters
-           e. Novelty — prefer diverse handles over repeated entries from the same author
-
-        3. Output ONLY a JSON array of the selected alert IDs in ranked order, like:
-           ["id1","id2","id3",...]
-           Do NOT output anything else — no explanation, no markdown, no extra text.
-           The IDs must be taken EXACTLY as they appear in "ID:..." lines below.
-
-        ALERTS:
-        {candidates_text}
-    """)
-
-    try:
-        raw_response = llm_generate(
-            prompt,
-            temperature=0.0,
-            max_tokens=2048,
-            timeout=300,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"LLM error: {e}")
-
-    # Parse the JSON array from the LLM response
-    import json as _json
-    ranked_ids: list = []
-    try:
-        # Extract the JSON array — handle LLM wrapping it in ```json ... ```
-        match = re.search(r"\[.*?\]", raw_response, re.DOTALL)
-        if match:
-            ranked_ids = _json.loads(match.group(0))
-    except Exception:
-        pass
-
-    if not ranked_ids:
-        logger.warning("top-alerts LLM parse failed; falling back to rule-based ranking")
-        priority_weight = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
-        candidates.sort(key=lambda x: (
-            -priority_weight.get(x[0].get("priority", "LOW"), 0),
-            -(x[0].get("threat_details") or {}).get("risk_score", 0),
-        ))
-        ranked_ids = [uid for _, _, uid in candidates[:top_n]]
-
-    # Build uuid_id → doc map
-    doc_map = {uid: d for d, _, uid in candidates}
-
-    # Assemble final list in ranked order, deduplicated
-    seen_ids: set = set()
-    result_docs = []
-    for rid in ranked_ids:
-        if rid in seen_ids or rid not in doc_map:
-            continue
-        seen_ids.add(rid)
-        d = doc_map[rid]
-        out = {k: v for k, v in d.items() if k != "_id"}
-        out["id"] = rid   # always the UUID string from the 'id' field
-        if isinstance(out.get("created_at"), datetime):
-            out["created_at"] = out["created_at"].isoformat()
-        result_docs.append(out)
-
-    # Fill to top_n with highest-scored unseen ones
-    if len(result_docs) < top_n:
-        priority_weight = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
-        remaining = sorted(
-            [(d, uid) for d, _, uid in candidates if uid not in seen_ids],
-            key=lambda x: (
-                -priority_weight.get(x[0].get("priority", "LOW"), 0),
-                -(x[0].get("threat_details") or {}).get("risk_score", 0),
-            )
-        )
-        for d, uid in remaining[: top_n - len(result_docs)]:
-            out = {k: v for k, v in d.items() if k != "_id"}
-            out["id"] = uid
-            if isinstance(out.get("created_at"), datetime):
-                out["created_at"] = out["created_at"].isoformat()
-            result_docs.append(out)
-
-    date_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    run_doc = {
-        "date": date_key,
-        "generated_at": datetime.now(timezone.utc),
-        "hours": hours,
-        "total_scanned": len(raw_docs),
-        "total_unique": total_unique,
-        "top_n": len(result_docs),
-        # Store only the alert IDs + lightweight metadata to keep the doc small
-        "alert_ids": [a["id"] for a in result_docs],
-        "alert_meta": [
-            {
-                "id": a["id"],
-                "priority": a.get("priority"),
-                "risk_level": a.get("risk_level"),
-                "source_category": a.get("source_category"),
-                "platform": a.get("platform"),
-                "author_handle": a.get("author_handle") or a.get("author"),
-                "content_url": a.get("content_url"),
-                "created_at": a.get("created_at"),
-                "threat_details": a.get("threat_details"),
-                "velocity_data": a.get("velocity_data"),
-                "classification_explanation": a.get("classification_explanation"),
-            }
-            for a in result_docs
-        ],
-    }
-    try:
-        client2 = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-        col2 = client2[DB_NAME]["rag_top_alerts"]
-        col2.create_index([("date", 1), ("hours", 1)])
-        col2.update_one(
-            {"date": date_key, "hours": hours},
-            {"$set": run_doc},
-            upsert=True,
-        )
-        client2.close()
-    except Exception as e:
-        logger.warning("Failed to persist top-alerts run: %s", e)
-
-    return {
-        "alerts": result_docs,
-        "total_scanned": len(raw_docs),
-        "total_unique": total_unique,
-        "top_n": len(result_docs),
-        "hours": hours,
-        "date": date_key,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Per-category Top-N Alerts endpoint
-#
-# Returns up to `top_n_per_category` LLM-ranked alerts for EACH source_category
-# (communal, political, defamation, narcotics, history_sheeters, trouble_makers,
-# others). The LLM is called once per category in parallel.
-# ---------------------------------------------------------------------------
-
-CATEGORY_KEYS = [
-    "communal", "political", "defamation",
-    "narcotics", "history_sheeters", "trouble_makers", "others",
-]
-
-
-class TopAlertsByCategoryRequest(BaseModel):
-    hours: int = 24                  # look-back window
-    top_n_per_category: int = 50     # max per category
-    categories: Optional[list] = None  # restrict to a subset; default = all
-
-
-def _rank_category_via_llm(category: str, candidates: list, top_n: int, hours: int) -> list:
-    """Call the vLLM LLM once for a single category and return ranked uuid IDs,
-    up to min(top_n, len(candidates)). After the LLM picks, pad with
-    priority+risk-score sorted candidates not already chosen so the result
-    always fills available capacity. Falls back fully to rule-based ranking
-    if the LLM is unreachable or returns nothing parseable."""
-    if not candidates:
-        return []
-
-    target = min(top_n, len(candidates))
-    snippets = "\n".join(s for _, s, _ in candidates)
-
-    # Pre-compute the rule-based fallback order once — used both as fallback
-    # and to pad short LLM responses.
-    priority_weight = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
-    rule_order = sorted(
-        candidates,
-        key=lambda x: (
-            -priority_weight.get(x[0].get("priority", "LOW"), 0),
-            -(x[0].get("threat_details") or {}).get("risk_score", 0),
-        ),
-    )
-    rule_ids = [uid for _, _, uid in rule_order]
-
-    prompt = textwrap.dedent(f"""\
-        You are a Telangana Police SOC analyst reviewing alerts in the
-        "{category}" category from the last {hours} hour(s).
-
-        TASK: Return the top {target} most important alert IDs from the list below,
-        ranked from MOST important to LEAST important.
-        - If there are fewer than {target} alerts in the list, return ALL of them
-          ranked in order.
-        - Do NOT skip alerts: every alert in the list should appear in your
-          output unless you are returning the full {target}-item cap.
-        - Ranking priority (highest first):
-            a. Direct threat to public order / law-and-order incidents
-            b. High velocity / viral spread
-            c. High risk score (80%+)
-            d. Diverse handles — prefer variety over repeating the same author
-
-        Output ONLY a JSON array of the alert IDs in ranked order:
-          ["id1","id2","id3",...]
-        No explanation. No markdown. IDs must be taken EXACTLY as shown in "ID:" lines.
-        Your array MUST contain {target} IDs (or all alerts if fewer than {target} were supplied).
-
-        ALERTS ({len(candidates)} total):
-        {snippets}
-    """)
-
-    ranked_ids: list = []
-    try:
-        raw = llm_generate(
-            prompt,
-            temperature=0.0,
-            max_tokens=4096,
-            timeout=300,
-        )
-        import json as _json
-        # Greedy match so a [..] containing newlines is captured whole
-        match = re.search(r"\[.*\]", raw, re.DOTALL)
-        if match:
-            ranked_ids = _json.loads(match.group(0))
-    except Exception as e:
-        logger.warning("LLM ranking failed for category=%s: %s", category, e)
-
-    # Keep only valid IDs (the LLM occasionally hallucinates), de-dup
-    valid_ids = {uid for _, _, uid in candidates}
-    seen: set = set()
-    out: list = []
-    for rid in ranked_ids:
-        if rid in valid_ids and rid not in seen:
-            seen.add(rid)
-            out.append(rid)
-            if len(out) >= target:
-                break
-
-    # Pad with rule-based ranked candidates not yet chosen, until we hit target
-    if len(out) < target:
-        for rid in rule_ids:
-            if rid not in seen:
-                seen.add(rid)
-                out.append(rid)
-                if len(out) >= target:
-                    break
-
-    return out
-
-
-@app.post("/api/rag/top-alerts/by-category")
-def top_alerts_by_category(req: TopAlertsByCategoryRequest):
-    """For each source_category, ask the vLLM LLM to rank the top-N most important
-    alerts. Runs categories in parallel for latency. Returns a flat list of
-    ranked alerts (preserving per-category internal order) plus per-category
-    counts and breakdown."""
-    hours = max(1, min(req.hours, 168))
-    top_n = max(1, min(req.top_n_per_category, 100))
-    requested_subset = {c.strip().lower() for c in (req.categories or []) if c}
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-
-    try:
-        client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-        db = client[DB_NAME]
-        # Larger pool than the single-LLM endpoint since we're partitioning across categories
-        raw_docs = list(db.alerts.find(
-            {"created_at": {"$gte": cutoff}},
-            ALERT_FIELDS,
-        ).sort("created_at", DESCENDING).limit(5000))
-        client.close()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"MongoDB error: {e}")
+def _dummy_func(raw_docs, top_n, hours, requested_subset):
 
     if not raw_docs:
         return {"alerts": [], "categories": {}, "total_scanned": 0,
@@ -3022,18 +1566,7 @@ def top_alerts_by_category(req: TopAlertsByCategoryRequest):
             for a in result_docs
         ],
     }
-    try:
-        client2 = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-        col2 = client2[DB_NAME]["rag_top_alerts"]
-        col2.create_index([("date", 1), ("hours", 1), ("mode", 1)])
-        col2.update_one(
-            {"date": date_key, "hours": hours, "mode": "by_category"},
-            {"$set": run_doc},
-            upsert=True,
-        )
-        client2.close()
-    except Exception as e:
-        logger.warning("Failed to persist per-category top-alerts run: %s", e)
+    pass
 
     return {
         "alerts": result_docs,
@@ -3177,385 +1710,7 @@ def _enrich_with_content(db, alerts_list: list) -> list:
 def _collect_dir_data(hours: int = 24) -> dict:
     """Pull comprehensive social-media intelligence data for the DIR."""
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-    client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-    db = client[DB_NAME]
-    aq = {"created_at": {"$gte": cutoff}}
-
-    # ── 1. Trending topics (from matched keywords) ───────────────────────────
-    kw_pipeline = [
-        {"$match": {**aq, "matched_keywords_normalized": {"$exists": True, "$not": {"$size": 0}}}},
-        {"$unwind": "$matched_keywords_normalized"},
-        {"$match": {"matched_keywords_normalized": {"$ne": None, "$ne": ""}}},
-        {"$group": {
-            "_id": "$matched_keywords_normalized",
-            "count": {"$sum": 1},
-            "platforms": {"$addToSet": "$platform"},
-            "high_count": {"$sum": {"$cond": [{"$eq": ["$priority", "HIGH"]}, 1, 0]}},
-            "categories": {"$addToSet": "$source_category"},
-        }},
-        {"$sort": {"count": -1}},
-        {"$limit": 25},
-    ]
-    trending_keywords = list(db.alerts.aggregate(kw_pipeline))
-
-    # ── 2. Platform breakdown with sentiment distribution ────────────────────
-    plat_pipeline = [
-        {"$match": aq},
-        {"$group": {
-            "_id": "$platform",
-            "total":      {"$sum": 1},
-            "high_risk":  {"$sum": {"$cond": [{"$eq": ["$priority", "HIGH"]}, 1, 0]}},
-            "medium_risk":{"$sum": {"$cond": [{"$eq": ["$priority", "MEDIUM"]}, 1, 0]}},
-            "avg_risk_score": {"$avg": "$threat_details.risk_score"},
-            "sentiments": {"$push": "$llm_analysis.sentiment"},
-        }},
-        {"$sort": {"total": -1}},
-        {"$limit": 10},
-    ]
-    platform_data_raw = list(db.alerts.aggregate(plat_pipeline))
-    # Compute sentiment ratios per platform
-    platform_data = []
-    for p in platform_data_raw:
-        sents = [_sentiment_label(s) for s in (p.get("sentiments") or []) if s]
-        total_s = len(sents) or 1
-        p["sentiment_breakdown"] = {
-            "negative": round(sents.count("negative") / total_s * 100),
-            "positive": round(sents.count("positive") / total_s * 100),
-            "neutral":  round(sents.count("neutral")  / total_s * 100),
-        }
-        p.pop("sentiments", None)
-        p["avg_risk_score"] = round(p.get("avg_risk_score") or 0, 1)
-        platform_data.append(p)
-
-    # ── 3. Viral / high-velocity posts ──────────────────────────────────────
-    viral_posts_raw = list(db.alerts.find(
-        {**aq, "velocity_data.velocity": {"$gt": 0}},
-        {**ALERT_FIELDS, "velocity_data": 1, "content_url": 1, "title": 1},
-    ).sort("velocity_data.velocity", DESCENDING).limit(15))
-    viral_posts = []
-    for d in viral_posts_raw:
-        vdata = d.get("velocity_data") or {}
-        llm = d.get("llm_analysis") or {}
-        threat = d.get("threat_details") or {}
-        ts = d.get("created_at")
-        viral_posts.append({
-            "id": str(d.get("id") or d["_id"]),
-            "author_handle": (d.get("author_handle") or d.get("author") or "?").lstrip("@"),
-            "platform": d.get("platform", "?"),
-            "content_url": d.get("content_url", ""),
-            "priority": d.get("priority", "?"),
-            "source_category": d.get("source_category", "?"),
-            "alert_type": d.get("alert_type", "?"),
-            "velocity": vdata.get("velocity", 0),
-            "velocity_metric": vdata.get("metric", ""),
-            "velocity_window_min": vdata.get("time_window_minutes", "?"),
-            "risk_score": threat.get("risk_score") or llm.get("score") or 0,
-            "sentiment": llm.get("sentiment", ""),
-            "reasoning": (d.get("classification_explanation") or llm.get("reasoning") or "")[:200],
-            "timestamp": ts.isoformat() if isinstance(ts, datetime) else str(ts or ""),
-        })
-
-    # ── 4. Most active accounts ──────────────────────────────────────────────
-    account_pipeline = [
-        {"$match": aq},
-        {"$group": {
-            "_id": {"$ifNull": ["$author_handle", "$author"]},
-            "count": {"$sum": 1},
-            "high_count": {"$sum": {"$cond": [{"$eq": ["$priority", "HIGH"]}, 1, 0]}},
-            "categories": {"$addToSet": "$source_category"},
-            "platforms":  {"$addToSet": "$platform"},
-            "max_risk":   {"$max": "$threat_details.risk_score"},
-            "last_seen":  {"$max": "$created_at"},
-            "sample_url": {"$first": "$content_url"},
-        }},
-        {"$match": {"_id": {"$ne": None, "$ne": ""}}},
-        {"$sort": {"count": -1}},
-        {"$limit": 15},
-    ]
-    active_accounts_raw = list(db.alerts.aggregate(account_pipeline))
-    active_accounts = []
-    for a in active_accounts_raw:
-        ls = a.get("last_seen")
-        active_accounts.append({
-            "handle": (a.get("_id") or "?").lstrip("@"),
-            "alert_count": a["count"],
-            "high_risk_count": a.get("high_count", 0),
-            "categories": [c for c in (a.get("categories") or []) if c],
-            "platforms": [p for p in (a.get("platforms") or []) if p],
-            "max_risk_score": a.get("max_risk") or 0,
-            "last_seen": ls.isoformat() if isinstance(ls, datetime) else str(ls or ""),
-            "sample_url": a.get("sample_url", ""),
-        })
-
-    # ── 5. Category breakdown ────────────────────────────────────────────────
-    cat_pipeline = [
-        {"$match": aq},
-        {"$group": {
-            "_id": "$source_category",
-            "count": {"$sum": 1},
-            "high_risk": {"$sum": {"$cond": [{"$eq": ["$priority", "HIGH"]}, 1, 0]}},
-            "avg_risk_score": {"$avg": "$threat_details.risk_score"},
-            "platforms": {"$addToSet": "$platform"},
-        }},
-        {"$sort": {"count": -1}},
-    ]
-    categories_raw = list(db.alerts.aggregate(cat_pipeline))
-    categories = []
-    for c in categories_raw:
-        raw_cat = c.get("_id") or "unknown"
-        categories.append({
-            "category": raw_cat,
-            "label": _CATEGORY_LABELS.get(raw_cat, raw_cat.replace("_", " ").title()),
-            "count": c["count"],
-            "high_risk": c.get("high_risk", 0),
-            "avg_risk_score": round(c.get("avg_risk_score") or 0, 1),
-            "platforms": [p for p in (c.get("platforms") or []) if p],
-        })
-
-    # ── 6. Overall sentiment analysis ────────────────────────────────────────
-    sent_pipeline = [
-        {"$match": {**aq, "llm_analysis.sentiment": {"$exists": True, "$ne": None}}},
-        {"$group": {"_id": "$llm_analysis.sentiment", "count": {"$sum": 1}}},
-        {"$sort": {"count": -1}},
-    ]
-    sentiment_raw = list(db.alerts.aggregate(sent_pipeline))
-    # Normalise to negative / positive / neutral buckets
-    sent_buckets: dict = {"negative": 0, "positive": 0, "neutral": 0, "others": {}}
-    for s in sentiment_raw:
-        label = _sentiment_label(s.get("_id", ""))
-        if label in sent_buckets:
-            sent_buckets[label] += s["count"]
-        else:
-            sent_buckets["others"][s.get("_id", "?")] = s["count"]
-
-    # ── 7. High-threat posts with links ──────────────────────────────────────
-    threat_posts_raw = list(db.alerts.find(
-        {**aq, "priority": "HIGH"},
-        ALERT_FIELDS,
-    ).sort([("threat_details.risk_score", DESCENDING), ("created_at", DESCENDING)]).limit(20))
-    threat_posts = []
-    for d in threat_posts_raw:
-        llm = d.get("llm_analysis") or {}
-        threat = d.get("threat_details") or {}
-        ts = d.get("created_at")
-        vdata = d.get("velocity_data") or {}
-        legal = _safe_join(d.get("legal_sections"))
-        reasoning = (d.get("classification_explanation") or llm.get("reasoning") or "").strip()
-        if "Primary AI analysis unavailable" in reasoning:
-            reasoning = ""
-        threat_posts.append({
-            "id": str(d.get("id") or d["_id"]),
-            "author_handle": (d.get("author_handle") or d.get("author") or "?").lstrip("@"),
-            "platform": d.get("platform", "?"),
-            "content_url": d.get("content_url", ""),
-            "alert_type": d.get("alert_type", "?"),
-            "source_category": d.get("source_category", "?"),
-            "risk_score": threat.get("risk_score") or llm.get("score") or 0,
-            "priority": d.get("priority", "?"),
-            "sentiment": llm.get("sentiment", ""),
-            "legal_sections": legal,
-            "reasoning": reasoning[:250],
-            "velocity": vdata.get("velocity", 0),
-            "timestamp": ts.isoformat() if isinstance(ts, datetime) else str(ts or ""),
-            "keywords": d.get("matched_keywords_normalized") or [],
-        })
-
-    # ── 8. Summary stats ─────────────────────────────────────────────────────
-    total_alerts     = db.alerts.count_documents(aq)
-    high_alerts      = db.alerts.count_documents({**aq, "priority": "HIGH"})
-    med_alerts       = db.alerts.count_documents({**aq, "priority": "MEDIUM"})
-    active_alerts    = db.alerts.count_documents({**aq, "status": "active"})
-    escalated_alerts = db.alerts.count_documents({**aq, "status": "escalated"})
-    total_grievances = db.grievances.count_documents(aq)
-
-    # ── 9. Dial 100 calls in window ──────────────────────────────────────────
-    # Real records use either `date` (call timestamp) or `createdAt`.
-    dial100_q = {"$or": [
-        {"date":      {"$gte": cutoff}},
-        {"createdAt": {"$gte": cutoff}},
-    ]}
-    dial100_total = (
-        db.dial100incidents.count_documents(dial100_q)
-        if "dial100incidents" in db.list_collection_names() else 0
-    )
-
-    # ── 10. Grievance-family breakdown ───────────────────────────────────────
-    existing_cols = set(db.list_collection_names())
-    grievance_breakdown = {
-        "grievances":                  db.grievances.count_documents(aq) if "grievances" in existing_cols else 0,
-        "criticism_reports":           0,
-        "suggestion_reports":          0,
-        "grievance_workflow_reports":  0,
-        "workflow_escalated":          0,
-        "workflow_pending":            0,
-        "workflow_closed":             0,
-    }
-    if "criticism_reports" in existing_cols:
-        grievance_breakdown["criticism_reports"] = db.criticism_reports.count_documents(
-            {"$or": [{"created_at": {"$gte": cutoff}}, {"createdAt": {"$gte": cutoff}}]}
-        )
-    if "suggestion_reports" in existing_cols:
-        grievance_breakdown["suggestion_reports"] = db.suggestion_reports.count_documents(
-            {"$or": [{"created_at": {"$gte": cutoff}}, {"createdAt": {"$gte": cutoff}}]}
-        )
-    if "grievance_workflow_reports" in existing_cols:
-        wf_q = {"$or": [{"created_at": {"$gte": cutoff}}, {"createdAt": {"$gte": cutoff}}]}
-        grievance_breakdown["grievance_workflow_reports"] = db.grievance_workflow_reports.count_documents(wf_q)
-        grievance_breakdown["workflow_escalated"] = db.grievance_workflow_reports.count_documents(
-            {**wf_q, "status": "ESCALATED"}
-        )
-        grievance_breakdown["workflow_pending"] = db.grievance_workflow_reports.count_documents(
-            {**wf_q, "status": "PENDING"}
-        )
-        grievance_breakdown["workflow_closed"] = db.grievance_workflow_reports.count_documents(
-            {**wf_q, "status": "CLOSED"}
-        )
-
-    # ── 11. Events: fetched vs relevant ──────────────────────────────────────
-    events_breakdown = {"fetched": 0, "relevant": 0, "active": 0, "recent": []}
-    if "events" in existing_cols:
-        ev_q = {"$or": [{"created_at": {"$gte": cutoff}}, {"start_date": {"$gte": cutoff}}]}
-        events_breakdown["fetched"] = db.events.count_documents(ev_q)
-        # "Relevant" = events that produced alerts in the same window (linked via event_ids)
-        # OR are currently active.
-        events_breakdown["active"] = db.events.count_documents(
-            {**ev_q, "status": {"$in": ["active", "planned"]}}
-        )
-        try:
-            relevant_event_ids = db.alerts.distinct("event_ids", aq) or []
-            relevant_event_ids = [e for e in relevant_event_ids if e]
-            events_breakdown["relevant"] = (
-                db.events.count_documents({"_id": {"$in": relevant_event_ids}})
-                if relevant_event_ids else events_breakdown["active"]
-            )
-        except Exception:
-            events_breakdown["relevant"] = events_breakdown["active"]
-        # Top 10 recent events
-        recent_ev = list(db.events.find(
-            ev_q,
-            {"_id": 1, "name": 1, "start_date": 1, "end_date": 1, "location": 1,
-             "status": 1, "platforms": 1, "keywords": 1},
-        ).sort("start_date", DESCENDING).limit(10))
-        for e in recent_ev:
-            kws = ", ".join((k.get("keyword") or "") for k in (e.get("keywords") or [])[:5])
-            events_breakdown["recent"].append({
-                "id":         str(e.get("_id")),
-                "name":       e.get("name", "?"),
-                "status":     e.get("status", "?"),
-                "location":   e.get("location", "?"),
-                "platforms":  e.get("platforms") or [],
-                "keywords":   kws,
-                "start_date": e["start_date"].isoformat()
-                              if isinstance(e.get("start_date"), datetime) else "",
-                "end_date":   e["end_date"].isoformat()
-                              if isinstance(e.get("end_date"), datetime) else "",
-            })
-
-    # ── 12. Top 50 alerts (full list with URLs) ──────────────────────────────
-    top_50_raw = list(db.alerts.find(
-        aq, ALERT_FIELDS,
-    ).sort([
-        ("priority", DESCENDING),  # HIGH > MEDIUM > LOW alphabetically too
-        ("threat_details.risk_score", DESCENDING),
-        ("created_at", DESCENDING),
-    ]).limit(50))
-    top_50_alerts = []
-    for d in top_50_raw:
-        llm = d.get("llm_analysis") or {}
-        threat = d.get("threat_details") or {}
-        ts = d.get("created_at")
-        top_50_alerts.append({
-            "id":             str(d.get("id") or d["_id"]),
-            "author_handle":  (d.get("author_handle") or d.get("author") or "?").lstrip("@"),
-            "platform":       d.get("platform", "?"),
-            "content_url":    d.get("content_url", ""),
-            "alert_type":     d.get("alert_type", "?"),
-            "source_category": d.get("source_category", "?"),
-            "priority":       d.get("priority", "?"),
-            "status":         d.get("status", "?"),
-            "risk_score":     threat.get("risk_score") or llm.get("score") or 0,
-            "sentiment":      llm.get("sentiment", ""),
-            "title":          (d.get("title") or "")[:120],
-            "timestamp":      ts.isoformat() if isinstance(ts, datetime) else str(ts or ""),
-        })
-
-    # ── 13. Top 5 concepts (largest source_categories with sample handles) ────
-    concept_pipeline = [
-        {"$match": {**aq, "source_category": {"$ne": None, "$ne": ""}}},
-        {"$group": {
-            "_id": "$source_category",
-            "count":     {"$sum": 1},
-            "high":      {"$sum": {"$cond": [{"$eq": ["$priority", "HIGH"]}, 1, 0]}},
-            "platforms": {"$addToSet": "$platform"},
-            "handles":   {"$addToSet": {"$ifNull": ["$author_handle", "$author"]}},
-            "sample_url": {"$first": "$content_url"},
-            "avg_risk":   {"$avg": "$threat_details.risk_score"},
-        }},
-        {"$sort": {"count": -1}},
-        {"$limit": 5},
-    ]
-    top_concepts_raw = list(db.alerts.aggregate(concept_pipeline))
-    top_concepts = []
-    for c in top_concepts_raw:
-        raw_cat = c.get("_id") or "unknown"
-        handles = [h for h in (c.get("handles") or []) if h][:5]
-        top_concepts.append({
-            "concept":        raw_cat,
-            "label":          _CATEGORY_LABELS.get(raw_cat, raw_cat.replace("_", " ").title()),
-            "alert_count":    c["count"],
-            "high_risk":      c.get("high", 0),
-            "avg_risk_score": round(c.get("avg_risk") or 0, 1),
-            "platforms":      [p for p in (c.get("platforms") or []) if p],
-            "sample_handles": handles,
-            "sample_url":     c.get("sample_url", ""),
-        })
-
-    # ── 14. Profiles (monitored sources) ─────────────────────────────────────
-    profiles_breakdown = {
-        "monitored":     0,
-        "active":        0,
-        "added_24h":     0,
-        "deleted_24h":   0,
-        "high_risk":     0,
-    }
-    if "sources" in existing_cols:
-        profiles_breakdown["monitored"] = db.sources.estimated_document_count()
-        profiles_breakdown["active"]    = db.sources.count_documents({"is_active": True})
-        profiles_breakdown["added_24h"] = db.sources.count_documents({"created_at": {"$gte": cutoff}})
-        profiles_breakdown["high_risk"] = db.sources.count_documents(
-            {"risk_level": {"$in": ["high", "critical"]}}
-        )
-    # Deletions tracked via audit_logs (resource_type='source', action containing 'delete')
-    if "audit_logs" in existing_cols:
-        try:
-            profiles_breakdown["deleted_24h"] = db.audit_logs.count_documents({
-                "$and": [
-                    {"$or": [{"created_at": {"$gte": cutoff}}, {"createdAt": {"$gte": cutoff}}, {"timestamp": {"$gte": cutoff}}]},
-                    {"resource_type": {"$regex": "source", "$options": "i"}},
-                    {"action":        {"$regex": "delete", "$options": "i"}},
-                ]
-            })
-        except Exception:
-            pass
-
-    # ── 15. Top 10 monitored keywords (configured watch-words) ───────────────
-    top_keywords_10 = []
-    if "keywords" in existing_cols:
-        kw_docs = list(db.keywords.find(
-            {"is_active": {"$ne": False}},
-            {"_id": 0, "keyword": 1, "category": 1, "language": 1, "weight": 1,
-             "is_active": 1, "created_at": 1},
-        ).sort([("weight", DESCENDING), ("created_at", DESCENDING)]).limit(10))
-        for k in kw_docs:
-            top_keywords_10.append({
-                "keyword":  k.get("keyword", "?"),
-                "category": k.get("category", "?"),
-                "language": k.get("language", "?"),
-                "weight":   k.get("weight", 0),
-                "active":   k.get("is_active", True),
-            })
-
-    client.close()
+    ctx = []
 
     return {
         "window_hours": hours,
@@ -3595,19 +1750,7 @@ def _build_dir(hours: int = 24, force: bool = False) -> dict:
     date_key = now.strftime("%Y-%m-%d")
     cache_key = f"{date_key}_{hours}h"
 
-    client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-    db = client[DB_NAME]
-    cache = db[DIR_COLLECTION]
-    cache.create_index([("cache_key", 1)], unique=True, background=True)
-    if not force:
-        existing = cache.find_one({"cache_key": cache_key})
-        if existing:
-            existing.pop("_id", None)
-            if isinstance(existing.get("generated_at"), datetime):
-                existing["generated_at"] = existing["generated_at"].isoformat()
-            client.close()
-            return existing
-    client.close()
+    pass
 
     raw = _collect_dir_data(hours=hours)
     s = raw["stats"]
@@ -3741,14 +1884,7 @@ def _build_dir(hours: int = 24, force: bool = False) -> dict:
         "llm_summary":       llm_summary,
     }
 
-    try:
-        c2 = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-        c2[DB_NAME][DIR_COLLECTION].update_one(
-            {"cache_key": cache_key}, {"$set": doc}, upsert=True
-        )
-        c2.close()
-    except Exception as e:
-        logger.warning("DIR cache write failed: %s", e)
+    pass
 
     doc.pop("_id", None)
     doc["generated_at"] = doc["generated_at"].isoformat()
@@ -3770,15 +1906,7 @@ def get_dir(hours: int = 24, force: bool = False):
 def dir_history(limit: int = 14):
     """List historical Daily Intelligence Reports, newest first."""
     try:
-        client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-        col = client[DB_NAME][DIR_COLLECTION]
-        docs = list(
-            col.find({}, {
-                "trending_keywords": 0, "viral_posts": 0,
-                "active_accounts": 0, "threat_posts": 0,
-            }).sort("generated_at", DESCENDING).limit(min(limit, 60))
-        )
-        client.close()
+        ctx = []
         for d in docs:
             d.pop("_id", None)
             if isinstance(d.get("generated_at"), datetime):
@@ -3816,10 +1944,7 @@ def _start_dir_scheduler():
 def top_alerts_history(limit: int = 14):
     """List past top-alert runs stored in rag_top_alerts, newest first."""
     try:
-        client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-        col = client[DB_NAME]["rag_top_alerts"]
-        docs = list(col.find({}, {"alert_meta": 0}).sort("generated_at", DESCENDING).limit(min(limit, 60)))
-        client.close()
+        ctx = []
         for d in docs:
             d.pop("_id", None)
             if isinstance(d.get("generated_at"), datetime):
@@ -3837,15 +1962,7 @@ def top_alerts_cached(date: Optional[str] = None, hours: int = 24, mode: Optiona
     full cards via /api/alerts/bulk."""
     date_key = date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     try:
-        client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-        col = client[DB_NAME]["rag_top_alerts"]
-        if mode == "by_category":
-            query = {"date": date_key, "hours": hours, "mode": "by_category"}
-        else:
-            # Legacy cache docs were written without a `mode` field; match those.
-            query = {"date": date_key, "hours": hours, "mode": {"$exists": False}}
-        doc = col.find_one(query, {"_id": 0})
-        client.close()
+        ctx = []
         if not doc:
             return {"found": False, "date": date_key}
         if isinstance(doc.get("generated_at"), datetime):
@@ -3858,7 +1975,7 @@ def top_alerts_cached(date: Optional[str] = None, hours: int = 24, mode: Optiona
 
 @app.post("/api/rag/refresh-cache")
 def refresh_cache():
-    """Rebuild the local vector search cache from MongoDB."""
+    """Rebuild the local vector search cache from PostgreSQL."""
     try:
         store = VectorStore()
         store.refresh_cache()

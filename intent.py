@@ -2,7 +2,7 @@
 intent.py — request routing, capability boundaries and context budgeting.
 
 The assistant used to run the same pipeline for every question: always pull
-alerts + grievances from Mongo, always append vector hits, always demand a
+alerts + grievances from PostgreSQL, always append vector hits, always demand a
 long briefing from the LLM. That wasted retrieval on "hi", and — worse — the
 prompt told the model to pad thin context with general knowledge, which is a
 licence to hallucinate.
@@ -16,7 +16,7 @@ This module decides three things before any retrieval happens:
 Classification is rule-based on purpose: it adds no latency, costs no tokens,
 and does not depend on the (intermittently unavailable) LLM endpoint.
 
-Nothing here reads or writes MongoDB.
+Nothing here reads or writes PostgreSQL.
 """
 
 from __future__ import annotations

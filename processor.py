@@ -1,6 +1,6 @@
 """
 processor.py — STAGES 1 & 2
-  Stage 1: Memory-safe streaming reader for MongoDB documents.
+  Stage 1: Memory-safe streaming reader for PostgreSQL documents.
            Supports batch-based pagination with _id cursor for safe resumability.
   Stage 2: JSON → natural-language text converter.
 """
@@ -103,7 +103,7 @@ class PostgresStreamProcessor:
 # ---------------------------------------------------------------------------
 
 class DocumentConverter:
-    """Flatten a MongoDB document into a readable text block."""
+    """Flatten a PostgreSQL document into a readable text block."""
 
     # Fields to always skip (internal / binary / large)
     SKIP_FIELDS = {"__v", "password", "passwordHash", "salt", "refreshToken"}

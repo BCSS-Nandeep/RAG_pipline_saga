@@ -6,7 +6,7 @@
         .\run.ps1 -Reload         # auto-restart on code changes
         .\run.ps1 -NoBrowser
 
-    Checks MongoDB and the LLM endpoint first so a failure is obvious here
+    Checks PostgreSQL and the LLM endpoint first so a failure is obvious here
     rather than halfway through a query.
 #>
 param(
@@ -26,15 +26,7 @@ Write-Host ""
 Write-Host "  SOC-EYE RAG pipeline" -ForegroundColor Cyan
 Write-Host "  --------------------" -ForegroundColor Cyan
 
-# --- MongoDB ---------------------------------------------------------------
-$svc = Get-Service -Name "MongoDB" -ErrorAction SilentlyContinue
-if ($svc -and $svc.Status -ne "Running") {
-    Write-Host "  MongoDB service is stopped - starting it..." -ForegroundColor Yellow
-    Start-Service MongoDB
-    Start-Sleep -Seconds 3
-}
-
-# --- preflight (Mongo + LLM reachability) ----------------------------------
+# --- preflight (PostgreSQL + LLM reachability) ----------------------------------
 $env:PYTHONIOENCODING = "utf-8"
 & $py -c @"
 import os, sys
@@ -42,13 +34,7 @@ from dotenv import load_dotenv
 load_dotenv()
 ok = True
 try:
-    from pymongo import MongoClient
-    uri, db = os.getenv('MONGODB_URI'), os.getenv('DB_NAME')
-    c = MongoClient(uri, serverSelectionTimeoutMS=5000); c.admin.command('ping')
-    n = len(c[db].list_collection_names()); c.close()
-    print(f'  MongoDB          : HEALTHY  {uri} db={db} ({n} collections)')
-except Exception as e:
-    ok = False; print(f'  MongoDB          : UNHEALTHY ({e})')
+    # PostgreSQL health check handled by standard startup
 try:
     import llm_client
     llm_ok = llm_client.check_health()

@@ -1,7 +1,7 @@
 """
 vector_store.py — STAGE 5 (PostgreSQL Native Edition)
   Store embeddings in PostgreSQL and perform cosine-similarity search natively.
-  Replaces the old MongoDB + NumPy cache implementation.
+  Replaces the old PostgreSQL + NumPy cache implementation.
 """
 
 import json
@@ -53,16 +53,14 @@ class VectorStore:
                         document_id,
                         chunk_index,
                         text,
-                        embedding,
-                        embedding_norm,
+                        embedding_vector,
                         metadata,
                         created_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ) VALUES (%s, %s, %s, %s, %s, %s)
                     ON CONFLICT (document_id, chunk_index)
                     DO UPDATE SET
                         text = EXCLUDED.text,
-                        embedding = EXCLUDED.embedding,
-                        embedding_norm = EXCLUDED.embedding_norm,
+                        embedding_vector = EXCLUDED.embedding_vector,
                         metadata = EXCLUDED.metadata,
                         created_at = EXCLUDED.created_at;
                 """
@@ -73,7 +71,6 @@ class VectorStore:
                     if len(emb) != 768:
                         raise ValueError(f"Embedding must be 768 dimensions, got {len(emb)}")
 
-                    norm = math.sqrt(sum(x * x for x in emb))
                     doc_id = meta["document_id"]
                     chunk_idx = meta["chunk_index"]
                     text = chunk["text"]
@@ -87,7 +84,7 @@ class VectorStore:
 
                     meta_json = json.dumps(meta, default=str)
 
-                    params.append((doc_id, chunk_idx, text, emb, norm, meta_json, created_at))
+                    params.append((doc_id, chunk_idx, text, emb, meta_json, created_at))
 
                 cur.executemany(sql, params)
                 written = cur.rowcount if cur.rowcount >= 0 else len(chunks)
@@ -95,6 +92,23 @@ class VectorStore:
 
         logger.debug("Upserted %d chunks into PostgreSQL.", len(chunks))
         return len(chunks)
+
+    def delete_by_document_id(self, document_id: str) -> int:
+        """Delete all chunks for a given document_id.
+
+        Used during re-embedding when a document's content has changed, to
+        remove stale chunks before inserting the new ones.
+        """
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM vector_embeddings WHERE document_id = %s",
+                    (document_id,)
+                )
+                deleted = cur.rowcount
+            conn.commit()
+        logger.debug("Deleted %d chunks for document_id=%s", deleted, document_id)
+        return deleted
 
     # -- read / search -------------------------------------------------------
 
@@ -158,22 +172,15 @@ class VectorStore:
         if query_norm == 0:
             return []
 
-        q_norm_vec = [x / query_norm for x in query_vector]
-
+        # Note: pgvector distances: 1 - cosine_distance = cosine_similarity
         sql = """
-            WITH q AS (
-                SELECT %s::DOUBLE PRECISION[] AS vec
-            )
             SELECT
                 text,
                 metadata,
-                (
-                    SELECT sum(q * d)
-                    FROM unnest(q.vec, embedding) AS u(q, d)
-                ) / NULLIF(embedding_norm, 0) AS score
-            FROM vector_embeddings, q
+                1 - (embedding_vector <=> %s::vector) AS score
+            FROM vector_embeddings
         """
-        params = [q_norm_vec]
+        params = [query_vector]
 
         where_clauses = []
         if source_collection:
@@ -185,13 +192,14 @@ class VectorStore:
             params.append(doc_ids)
 
         if cutoff_date:
-            where_clauses.append("created_at >= %s")
+            where_clauses.append("(metadata->>'source_created_at') IS NOT NULL AND (metadata->>'source_created_at')::timestamp >= %s::timestamp")
             params.append(cutoff_date)
 
         if where_clauses:
             sql += " WHERE " + " AND ".join(where_clauses)
 
-        sql += " ORDER BY score DESC LIMIT %s;"
+        sql += " ORDER BY embedding_vector <=> %s::vector LIMIT %s;"
+        params.append(query_vector)
         params.append(top_k)
 
         results = []

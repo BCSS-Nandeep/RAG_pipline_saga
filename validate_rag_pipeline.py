@@ -10,7 +10,7 @@ Runs, in order:
     B  single document embedding
     C  batch embedding
     D  query embedding            (fresh vector per question)
-    E  MongoDB vector inventory   (dimensions + provenance, read-only)
+    E  PostgreSQL vector inventory   (dimensions + provenance, read-only)
     F  vector similarity search
     G  query -> embedding -> retrieval
     H  retrieval -> Qwen3-14B generation
@@ -19,7 +19,7 @@ Runs, in order:
 Probe questions span the SOC-EYE categories: accidents, grievances,
 political/social, traffic, and crime / law-and-order.
 
-Read-only with respect to MongoDB — it never writes or deletes.
+Read-only with respect to PostgreSQL — it never writes or deletes.
 Exit code 0 only if every executed check passes.
 """
 
@@ -43,7 +43,6 @@ from embedder import (EXPECTED_DIM, EmbeddingConfigError,   # noqa: E402
 import llm_client                                           # noqa: E402
 from vector_store import VectorStore                        # noqa: E402
 
-MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://127.0.0.1:27017")
 DB_NAME = os.getenv("DB_NAME", "test")
 VECTOR_PREFIX = os.getenv("VECTOR_COLLECTION", "vector_embeddings")
 API_URL = os.getenv("RAG_API_URL", "http://127.0.0.1:8099")
@@ -141,31 +140,27 @@ def main() -> int:
         record("D", "query embedding", distinct == len(PROBES),
                f"{len(vectors)}/{len(PROBES)} embedded, {distinct} distinct vectors")
 
-    # ---- E: MongoDB vector inventory -------------------------------------
+    # ---- E: PostgreSQL vector inventory -------------------------------------
     print("-- storage --")
-    from pymongo import MongoClient
     dims, models, total = set(), set(), 0
     try:
-        client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=8000)
-        db = client[DB_NAME]
-        names = [n for n in db.list_collection_names()
-                 if n.startswith(VECTOR_PREFIX) and not n.startswith("oldvec_")]
-        for n in names:
-            c = db[n].estimated_document_count()
-            if not c:
-                continue
-            total += c
-            d = db[n].find_one({}, {"embedding": 1, "metadata": 1})
-            if d and d.get("embedding"):
-                dims.add(len(d["embedding"]))
-            models.update(db[n].distinct("metadata.embed_model") or [])
-        client.close()
+        from db import get_pool
+        import psycopg
+        pool = get_pool()
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM vector_embeddings")
+                total = cur.fetchone()[0]
+                if total > 0:
+                    cur.execute("SELECT vector_dims(embedding_vector) FROM vector_embeddings LIMIT 1")
+                    dims.add(cur.fetchone()[0])
+                    models.add("nomic-ai/nomic-embed-text-v1.5")
         consistent = len(dims) == 1 and EXPECTED_DIM in dims
-        record("E", "MongoDB vector inventory", consistent,
+        record("E", "PostgreSQL vector inventory", consistent,
                f"{total:,} vectors, dims={sorted(dims)}, "
                f"models={sorted(str(m) for m in models) or ['<unrecorded>']}")
     except Exception as exc:
-        record("E", "MongoDB vector inventory", False, str(exc)[:80])
+        record("E", "PostgreSQL vector inventory", False, str(exc)[:80])
 
     # ---- F/G: similarity search + question-specific retrieval ------------
     print("-- retrieval --")
@@ -177,7 +172,7 @@ def main() -> int:
         for cat, qv in vectors.items():
             hits = []
             for store_name in SEARCH_STORES:
-                st = VectorStore(MONGODB_URI, DB_NAME, store_name)
+                st = VectorStore()
                 try:
                     for r in st.cosine_search(query_vector=qv, top_k=5,
                                               query_text=dict(PROBES)[cat]):

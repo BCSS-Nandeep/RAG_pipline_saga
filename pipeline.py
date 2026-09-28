@@ -4,7 +4,7 @@ pipeline.py — CLI entry point and orchestrator for the RAG pipeline.
 Usage:
     python pipeline.py --ingest              # Run stages 1–5 (stream → embed → store)
     python pipeline.py --query "question"    # Run stage 6  (ask the AI assistant)
-    python pipeline.py --check               # Verify MongoDB + vLLM connectivity
+    python pipeline.py --check               # Verify PostgreSQL + vLLM connectivity
     python pipeline.py --stats               # Show collection & vector store stats
 """
 
@@ -59,7 +59,7 @@ logger = logging.getLogger("pipeline")
 # ---------------------------------------------------------------------------
 
 def run_health_check() -> bool:
-    """Verify MongoDB and both self-hosted vLLM services are reachable."""
+    """Verify PostgreSQL and both self-hosted vLLM services are reachable."""
     ok = True
 
     # PostgreSQL
@@ -137,7 +137,7 @@ def run_ingestion(full: bool = False):
     """Execute the ingest pipeline in discrete batches with checkpoint resumability.
 
     Each batch:
-      1. Fetches BATCH_SIZE docs from MongoDB (sorted by _id, paginated)
+      1. Fetches BATCH_SIZE docs from PostgreSQL (sorted by _id, paginated)
       2. Converts + chunks them
       3. Embeds all chunks in one batch call to the vLLM embedding server
       4. Stores in vector DB
@@ -199,7 +199,7 @@ def run_ingestion(full: bool = False):
     )
 
     while True:
-        # Fetch one batch from MongoDB
+        # Fetch one batch from PostgreSQL
         docs = streamer.fetch_batch(batch_num, after_id=after_id)
         if not docs:
             logger.info("No more documents — all batches complete.")
@@ -339,7 +339,7 @@ def run_stats():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="RAG Pipeline — Ingest MongoDB data and query with vLLM Qwen3",
+        description="RAG Pipeline — Ingest PostgreSQL data and query with vLLM Qwen3",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             Examples:
@@ -352,7 +352,7 @@ def main():
     parser.add_argument("--ingest", action="store_true", help="Run ingestion pipeline (stages 1–5)")
     parser.add_argument("--full", action="store_true", help="Force full re-ingestion (skip incremental mode)")
     parser.add_argument("--query", type=str, metavar="QUESTION", help="Ask a question (stage 6)")
-    parser.add_argument("--check", action="store_true", help="Health-check MongoDB + vLLM services")
+    parser.add_argument("--check", action="store_true", help="Health-check PostgreSQL + vLLM services")
     parser.add_argument("--stats", action="store_true", help="Show collection stats")
     parser.add_argument("--build-cache", action="store_true", help="Build/rebuild the vector search cache")
 

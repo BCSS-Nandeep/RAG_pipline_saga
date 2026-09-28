@@ -19,35 +19,34 @@ if __name__ == "__main__":
                     print("Testing vector insert...")
                     
                     # Create 3 dummy vectors
-                    v1 = [0.1] * 768; v1[0] = 1.0; norm1 = math.sqrt(sum(x*x for x in v1))
-                    v2 = [0.1] * 768; v2[0] = 0.5; norm2 = math.sqrt(sum(x*x for x in v2))
-                    v3 = [0.1] * 768; v3[0] = -1.0; norm3 = math.sqrt(sum(x*x for x in v3))
+                    v1 = [0.1] * 768; v1[0] = 1.0;
+                    v2 = [0.1] * 768; v2[0] = 0.5;
+                    v3 = [0.1] * 768; v3[0] = -1.0;
                     
                     cur.execute("""
-                        INSERT INTO vector_embeddings (document_id, chunk_index, text, embedding, embedding_norm, metadata)
-                        VALUES (%s, %s, %s, %s, %s, %s),
-                               (%s, %s, %s, %s, %s, %s),
-                               (%s, %s, %s, %s, %s, %s)
+                        INSERT INTO vector_embeddings (document_id, chunk_index, text, embedding_vector, metadata)
+                        VALUES (%s, %s, %s, %s, %s),
+                               (%s, %s, %s, %s, %s),
+                               (%s, %s, %s, %s, %s)
                         RETURNING id;
                     """, (
-                        "doc_A", 0, "Hello vector 1", v1, norm1, '{"source_collection": "alerts"}',
-                        "doc_A", 1, "Hello vector 2", v2, norm2, '{"source_collection": "alerts"}',
-                        "doc_B", 0, "Hello vector 3", v3, norm3, '{"source_collection": "news"}'
+                        "doc_A", 0, "Hello vector 1", v1, '{"source_collection": "alerts"}',
+                        "doc_A", 1, "Hello vector 2", v2, '{"source_collection": "alerts"}',
+                        "doc_B", 0, "Hello vector 3", v3, '{"source_collection": "news"}'
                     ))
                     
-                    print("Testing vector query with cosine similarity...")
+                    print("Testing vector query with pgvector cosine similarity...")
                     query_vec = v1  # Should match v1 best
-                    query_norm = norm1
                     
                     cur.execute("""
                         SELECT document_id, chunk_index, text, 
-                               cosine_similarity(%s::DOUBLE PRECISION[], %s::DOUBLE PRECISION, embedding, embedding_norm) as score
+                               1 - (embedding_vector <=> %s::vector) as score
                         FROM vector_embeddings
                         WHERE document_id IN ('doc_A', 'doc_B')
                           AND metadata->>'source_collection' = 'alerts'
                         ORDER BY score DESC
                         LIMIT 2;
-                    """, (query_vec, query_norm))
+                    """, (query_vec,))
                     
                     results = cur.fetchall()
                     print("\nResults:")

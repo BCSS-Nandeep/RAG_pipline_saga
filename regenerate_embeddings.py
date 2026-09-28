@@ -8,7 +8,7 @@ collections are replaced, and the old ones are renamed aside before the new
 run so a failed rebuild cannot leave you with nothing.
 
     python regenerate_embeddings.py --preflight
-        Steps 1-4 only: validate Mongo, sources, model load, a test batch,
+        Steps 1-4 only: validate PostgreSQL, sources, model load, a test batch,
         dimension, NaN/Inf and write access. Changes nothing.
 
     python regenerate_embeddings.py --rebuild [--collections a,b] [--limit N]
@@ -33,8 +33,6 @@ from datetime import datetime, timezone
 from typing import Iterable, List, Optional
 
 from dotenv import load_dotenv
-from pymongo import ASCENDING, MongoClient, UpdateOne
-from pymongo.errors import BulkWriteError, OperationFailure
 
 load_dotenv()
 
@@ -49,7 +47,6 @@ logging.basicConfig(level=logging.INFO,
                     datefmt="%H:%M:%S")
 logger = logging.getLogger("regen")
 
-MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://127.0.0.1:27017")
 DB_NAME = os.getenv("DB_NAME", "test")
 VECTOR_PREFIX = os.getenv("VECTOR_COLLECTION", "vector_embeddings")
 RETIRED_PREFIX = "retired_"
@@ -79,10 +76,6 @@ DEFAULT_COLLECTIONS = [
 ]
 
 
-def connect() -> MongoClient:
-    c = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=8000)
-    c.admin.command("ping")
-    return c
 
 
 def vector_name(collection: str) -> str:
@@ -104,14 +97,14 @@ def preflight(collections: List[str]) -> Optional[dict]:
     print("=" * 74)
     ok = True
 
-    # -- STEP 1: Mongo + source data ---------------------------------------
+    # -- STEP 1: PostgreSQL + source data ---------------------------------------
     try:
         client = connect()
         db = client[DB_NAME]
         names = set(db.list_collection_names())
-        print(f"  [PASS] MongoDB reachable — {DB_NAME}, {len(names)} collections")
+        print(f"  [PASS] PostgreSQL reachable — {DB_NAME}, {len(names)} collections")
     except Exception as exc:
-        print(f"  [FAIL] MongoDB unreachable: {exc}")
+        print(f"  [FAIL] PostgreSQL unreachable: {exc}")
         return None
 
     present, missing, total_docs = [], [], 0
@@ -219,9 +212,8 @@ def preflight(collections: List[str]) -> Optional[dict]:
         probe_coll.insert_one({"_id": "probe", "at": datetime.now(timezone.utc)})
         probe_coll.delete_one({"_id": "probe"})
         probe_coll.drop()
-        print("  [PASS] MongoDB write access confirmed")
-    except Exception as exc:
-        print(f"  [FAIL] MongoDB write access: {exc}")
+            except Exception as exc:
+        print(f"  [FAIL] PostgreSQL write access: {exc}")
         ok = False
 
     client.close()

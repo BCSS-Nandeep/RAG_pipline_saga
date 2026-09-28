@@ -1,10 +1,10 @@
 # SOC-EYE RAG Pipeline
 
-Retrieval-augmented question answering over the SOC-EYE MongoDB corpus.
+Retrieval-augmented question answering over the SOC-EYE PostgreSQL corpus.
 
-```
-MongoDB  ──►  Nomic Embed Text v1.5  ──►  vector collections
-(source)      (local, GPU, in-process)     (MongoDB)
+```text
+PostgreSQL  ──►  Nomic Embed Text v1.5  ──►  vector_embeddings table
+(source)      (local, GPU, in-process)     (PostgreSQL native math)
                                                 │
 user question ──► search_query: ──► embedding ──┤
                                                 ▼
@@ -29,7 +29,7 @@ pip install -r requirements.txt
 .\run.ps1                 # http://127.0.0.1:8099/ui/
 ```
 
-`run.ps1` preflights MongoDB, the LLM endpoint and the embedding model before
+`run.ps1` preflights PostgreSQL, the LLM endpoint and the embedding model before
 starting, so a misconfiguration fails at launch rather than on the first query.
 
 ## Models
@@ -56,7 +56,7 @@ text and `embed_query()` for questions — never `embed_text()` for documents.
 
 ## Background ingest scheduler
 
-Keeps vector collections in step with MongoDB without manual commands.
+Keeps PostgreSQL `vector_embeddings` in step with the PostgreSQL `source_documents` table without manual commands.
 
 | Setting | Value | Meaning |
 |---|---|---|
@@ -88,8 +88,7 @@ interrupted or failed document simply has no recorded hash, so the next cycle
 treats it as new. That is what makes resume and retry automatic.
 
 Detection is poll-based, so a change is picked up within one interval — worst
-case 8 hours. Near-real-time would need MongoDB change streams, which require a
-replica set.
+case 8 hours. Near-real-time would need PostgreSQL LISTEN/NOTIFY or triggers.
 
 ### Legacy vectors are not touched
 
@@ -119,8 +118,8 @@ vLLM server is required.
 |---|---|
 | Python | 3.10+ (3.14 verified) |
 | GPU | NVIDIA, 4 GB VRAM or more, recent driver. CPU works but is ~10x slower |
-| Disk | ~3 GB for PyTorch + ~600 MB for the model, plus the MongoDB data |
-| Network | MongoDB, and outbound to `LLM_BASE_URL` |
+| Disk | ~3 GB for PyTorch + ~600 MB for the model, plus the PostgreSQL data |
+| Network | PostgreSQL and outbound to `LLM_BASE_URL` |
 
 ### 2. Install
 
@@ -150,7 +149,7 @@ has a working default. **`.env` is gitignored — never commit it.**
 ### 4. Verify before serving
 
 ```bash
-python pipeline.py --check          # MongoDB + embedding model + LLM
+python pipeline.py --check          # PostgreSQL + embedding model + LLM
 python validate_gates.py            # CUDA, 768-d, prefixes, retrieval, RAG
 ```
 
@@ -237,7 +236,7 @@ for a broad one — never a fixed number, and never the whole database.
 | `python validate_rag_pipeline.py` | full A–I pipeline validation |
 | `python test_sync_workflow.py` | sync tests on an isolated DB (never touches production) |
 | `python regenerate_embeddings.py --preflight` | validate before any rebuild |
-| `python pipeline.py --check` | MongoDB + embedding + LLM health |
+| `python pipeline.py --check` | PostgreSQL + embedding + LLM health |
 | `python pipeline.py --stats` | collection and vector counts |
 
 ## API
@@ -246,7 +245,7 @@ for a broad one — never a fixed number, and never the whole database.
 |---|---|
 | `GET /ui/` | browser test console |
 | `GET /docs` | OpenAPI reference |
-| `GET /api/rag/health` | MongoDB, embedding (model/device/dimension), LLM |
+| `GET /api/rag/health` | PostgreSQL, embedding (model/device/dimension), LLM |
 | `POST /api/rag/query` | ask a question |
 | `POST /api/rag/ingest` | sync one collection now |
 | `GET /api/rag/scheduler/status` | last run, next run, current collection |
@@ -254,7 +253,7 @@ for a broad one — never a fixed number, and never the whole database.
 
 ## Requirements
 
-- MongoDB (local)
+- PostgreSQL
 - Python 3.14 with CUDA-enabled PyTorch for GPU embedding
 - Reachable vLLM server running Qwen3-14B
 

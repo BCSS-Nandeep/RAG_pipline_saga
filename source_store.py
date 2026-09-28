@@ -8,7 +8,7 @@ from db import get_pool
 logger = logging.getLogger(__name__)
 
 class SourceStore:
-    """PostgreSQL repository for source documents, replacing MongoStreamProcessor."""
+    """PostgreSQL repository for source documents, replacing PostgreSQLStreamProcessor."""
 
     def __init__(self):
         self._pool = get_pool()
@@ -91,7 +91,7 @@ class SourceStore:
     ) -> List[Dict[str, Any]]:
         """Fetch documents for incremental ingestion with ordering by ID.
         
-        This perfectly mirrors MongoStreamProcessor's sorting and pagination capabilities.
+        This perfectly mirrors PostgreSQLStreamProcessor's sorting and pagination capabilities.
         """
         sql = "SELECT document_data FROM source_documents WHERE collection_name = %s"
         params = [collection_name]

@@ -37,7 +37,8 @@ def get_pool() -> ConnectionPool:
         
         # Enable unnesting and general connection settings
         def configure_connection(conn):
-            pass
+            import pgvector.psycopg
+            pgvector.psycopg.register_vector(conn)
             
         _pool = ConnectionPool(
             conninfo=PG_URL,
@@ -64,8 +65,6 @@ def init_db():
                     document_id TEXT NOT NULL,
                     chunk_index INTEGER NOT NULL,
                     text TEXT NOT NULL,
-                    embedding DOUBLE PRECISION[] NOT NULL,
-                    embedding_norm DOUBLE PRECISION NOT NULL,
                     metadata JSONB,
                     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
                     
@@ -84,18 +83,6 @@ def init_db():
                 ON vector_embeddings USING btree (document_id);
                 """)
 
-                # Create SQL helper function for cosine similarity
-                cur.execute("""
-                CREATE OR REPLACE FUNCTION cosine_similarity(
-                    query_emb DOUBLE PRECISION[],
-                    query_norm DOUBLE PRECISION,
-                    doc_emb DOUBLE PRECISION[],
-                    doc_norm DOUBLE PRECISION
-                ) RETURNS DOUBLE PRECISION AS $$
-                    SELECT sum(x * y) / (query_norm * doc_norm)
-                    FROM unnest(query_emb, doc_emb) AS t(x, y);
-                $$ LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE;
-                """)
 
                 # Create the source_documents table
                 cur.execute("""
@@ -144,15 +131,7 @@ def check_postgres_connection() -> bool:
                     logger.error("Health check failed: SELECT 1 returned unexpected result.")
                     return False
                 
-                # 2. Verify cosine_similarity function is available
-                cur.execute(
-                    "SELECT 1 FROM pg_proc WHERE proname = 'cosine_similarity';"
-                )
-                ext = cur.fetchone()
-                if not ext:
-                    logger.error("Health check failed: 'cosine_similarity' function is missing.")
-                    return False
-                    
+
         logger.info("PostgreSQL health check passed. Connection acquired and native schema available.")
         return True
     except Exception as e:

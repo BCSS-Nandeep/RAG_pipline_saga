@@ -14,7 +14,7 @@ validate_gates.py — the checks that must pass BEFORE any regeneration runs.
 
 Gate 6 embeds a small in-memory pilot from a real source collection with the
 new model and searches that, so both sides of the comparison come from the
-same model. Nothing is written to MongoDB and no existing vector is touched —
+same model. Nothing is written to PostgreSQL and no existing vector is touched —
 this runs safely before the corpus is rebuilt.
 
 Exit code 0 only when every gate passes.
@@ -34,7 +34,6 @@ load_dotenv()
 logging.basicConfig(level=logging.WARNING,
                     format="%(levelname)s %(message)s")
 
-MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://127.0.0.1:27017")
 DB_NAME = os.getenv("DB_NAME", "test")
 PILOT_COLLECTION = os.getenv("GATE_PILOT_COLLECTION", "alerts")
 PILOT_DOCS = int(os.getenv("GATE_PILOT_DOCS", "150"))
@@ -138,21 +137,24 @@ def main() -> int:
 
     # ---- Gate 6: semantic retrieval on fresh same-model vectors ----------
     import numpy as np
-    from pymongo import MongoClient
     from processor import DocumentConverter
 
     retrieved_ctx: List[str] = []
     try:
-        client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=8000)
-        db = client[DB_NAME]
+        from db import get_pool
+        import psycopg
+        pool = get_pool()
         conv = DocumentConverter()
         texts, labels = [], []
-        for doc in db[PILOT_COLLECTION].find({}).limit(PILOT_DOCS):
-            t = conv.convert(doc)
-            if t.strip():
-                texts.append(t[:1500])
-                labels.append(str(doc.get("_id")))
-        client.close()
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+                cur.execute("SELECT document_data FROM source_documents WHERE collection_name = %s LIMIT %s", (PILOT_COLLECTION, PILOT_DOCS))
+                for row in cur.fetchall():
+                    doc = row['document_data']
+                    t = conv.convert(doc)
+                    if t.strip():
+                        texts.append(t[:1500])
+                        labels.append(doc.get('_id', 'unknown'))
 
         if not texts:
             gate(6, "semantic retrieval", False,

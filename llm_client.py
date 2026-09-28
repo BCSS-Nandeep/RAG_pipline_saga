@@ -234,7 +234,7 @@ def generate(
             time.sleep(1.0 * (i + 1))
 
     return (f"_(LLM generation failed after {len(attempts)} attempts: "
-            f"{last_err}. Live evidence from MongoDB is shown below — "
+            f"{last_err}. Live evidence from PostgreSQL is shown below — "
             "please retry.)_")
 
 

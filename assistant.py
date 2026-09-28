@@ -274,8 +274,10 @@ class Assistant:
 
     @staticmethod
     def _build_prompt(question: str, context: str) -> str:
+        now_utc = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
         return (
             f"{SYSTEM_PROMPT}\n\n"
+            f"Current date and time: {now_utc}\n\n"
             f"=== CONTEXT (retrieved chunks) ===\n{context}\n=== END CONTEXT ===\n\n"
             f"User question: {question}\n\n"
             f"Answer:"
